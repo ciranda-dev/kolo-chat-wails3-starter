@@ -12,5 +12,6 @@ export {
     ConversationInfo,
     InviteInfo,
     InviteOptions,
-    Member
+    Member,
+    NetworkInfo
 } from "./models.js";

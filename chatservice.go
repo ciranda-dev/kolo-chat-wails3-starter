@@ -15,7 +15,6 @@ import (
 	"io"
 	"io/fs"
 	"log"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -210,11 +209,11 @@ func (c *ChatService) start() (err error) {
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.push = make(chan struct{}, 1)
-	swarmCfg := &koloswarm.Config{LookupInterval: c.set.LookupInterval, MaxTopics: swarmTopics, DHT: dhtConfig()}
+	swarmCfg := &koloswarm.Config{LookupInterval: c.set.LookupInterval, MaxTopics: swarmTopics, DHT: dhtConfig(), BootstrapNodes: c.set.bootstrap}
 	if c.sw, err = koloswarm.New(c.ctx, c.set.Listen, c.id, swarmCfg); err != nil {
 		return err
 	}
-	if err = c.sw.Bootstrap(c.ctx, []netip.AddrPort{c.set.bootstrap}); err != nil {
+	if err = bootstrap(c.ctx, c.sw, c.set); err != nil {
 		return err
 	}
 	log.Print("kolo-id ", c.id.PublicKeyString())

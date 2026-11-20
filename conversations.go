@@ -285,13 +285,17 @@ type ConversationInfo struct {
 	Admin  bool   `json:"admin"`
 	Error  string `json:"error"`
 	Folder string `json:"folder"`
+	// Network is "public" or "own" when the conversation did not start because no entry node of that network answered.
+	Network string `json:"network,omitempty"`
 }
 
-// AppInfo is what Start returns. CanCreate says the app has a pin, which a new conversation needs.
+// AppInfo is what Start returns. CanCreate says the app has a pin, which a new conversation needs, and Network which
+// network the app joins.
 type AppInfo struct {
 	Conversations    []ConversationInfo `json:"conversations"`
 	MaxConversations int                `json:"maxConversations"`
 	CanCreate        bool               `json:"canCreate"`
+	Network          NetworkInfo        `json:"network"`
 }
 
 // ConvEvent is the payload of every chat event: the conversation it is about, and the engine's payload.
@@ -632,12 +636,15 @@ func (e convEntry) info() ConversationInfo {
 	}
 	if e.err != nil {
 		info.Error, info.Folder = e.err.Error(), e.dir
+		if ne := (*NetworkError)(nil); errors.As(e.err, &ne) { // nothing is wrong with the folder
+			info.Folder, info.Network = "", ne.Network.Mode
+		}
 	}
 	return info
 }
 
 func (a *Conversations) info() AppInfo {
-	return AppInfo{Conversations: a.List(), MaxConversations: maxConversations, CanCreate: len(a.set.pinKey) > 0}
+	return AppInfo{Conversations: a.List(), MaxConversations: maxConversations, CanCreate: len(a.set.pinKey) > 0, Network: a.set.network()}
 }
 
 func (a *Conversations) infoOf(e *convEntry) ConversationInfo {

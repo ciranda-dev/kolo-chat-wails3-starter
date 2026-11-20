@@ -12,12 +12,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
+
+	koloswarm "github.com/ciranda-dev/kolo-swarm"
 )
 
 // Defaults of the settings that have one. Everything else must be configured.
 const (
-	defaultBootstrap      = "127.0.0.1:4000"
-	defaultListen         = "127.0.0.1:0"
+	loopbackListen        = "127.0.0.1:0"    // the default when every entry node is on this computer
+	publicListen          = "0.0.0.0:0"      // the default otherwise: the public network cannot be reached from loopback
 	defaultPinAddr        = "127.0.0.1:7450" // where `kolo-pin run` listens unless told otherwise
 	defaultPinTTL         = 30 * 24 * time.Hour
 	defaultPinQuota       = 16 << 20 // bytes
@@ -52,8 +54,8 @@ func (e *ConfigError) Is(target error) bool {
 // LoadConfig fills it from flags and environment variables.
 type Config struct {
 	DataDir         string        // -data, KOLO_CHAT_DATA: one folder per conversation, see conversations.go. Default: <user config dir>/kolo-chat
-	Bootstrap       string        // -bootstrap, KOLO_CHAT_BOOTSTRAP: IP:PORT of a bootstrap node. Default 127.0.0.1:4000
-	Listen          string        // -listen, KOLO_CHAT_LISTEN: local IP:PORT of every conversation. Default 127.0.0.1:0; a fixed port allows one conversation
+	Bootstrap       string        // -bootstrap, KOLO_CHAT_BOOTSTRAP: host:port of the entry nodes of your own network, comma-separated, used alone. Default: the public network
+	Listen          string        // -listen, KOLO_CHAT_LISTEN: local IP:PORT of every conversation. Default 127.0.0.1:0 when every entry node is on loopback, else 0.0.0.0:0; a fixed port allows one conversation
 	ConversationKey string        // -conversation-key, KOLO_CHAT_CONVERSATION_KEY: 64 hex characters (32 bytes), the key of one conversation, kept in its folder. Empty to start conversations in the window or join with an invite
 	PinAddr         string        // -pin, KOLO_CHAT_PIN: IP:PORT of the pin. Default 127.0.0.1:7450. The pin of the conversations started here; a joiner gets the pin from the invite
 	PinKey          string        // -pin-key, KOLO_CHAT_PIN_KEY: the pin's public key in hex (`kolo-pin id`). Required with a conversation key and to start conversations in the window
@@ -83,8 +85,8 @@ func LoadConfig(args []string, getenv func(string) string, stderr io.Writer) (Co
 		set             func(string) error
 	}{
 		{"data", "KOLO_CHAT_DATA", "data directory (default <user config dir>/kolo-chat)", text(&c.DataDir)},
-		{"bootstrap", "KOLO_CHAT_BOOTSTRAP", "IP:PORT of the bootstrap node (default " + defaultBootstrap + ")", text(&c.Bootstrap)},
-		{"listen", "KOLO_CHAT_LISTEN", "local IP:PORT to listen on (default " + defaultListen + ")", text(&c.Listen)},
+		{"bootstrap", "KOLO_CHAT_BOOTSTRAP", "host:port of the entry nodes of your own network, comma-separated, used alone (default: the public network)", text(&c.Bootstrap)},
+		{"listen", "KOLO_CHAT_LISTEN", "local IP:PORT to listen on (default " + loopbackListen + " when every entry node is on loopback, else " + publicListen + ")", text(&c.Listen)},
 		{"conversation-key", "KOLO_CHAT_CONVERSATION_KEY", "32-byte key of one conversation, in hex (leave it out to start conversations in the window or join with an invite)", text(&c.ConversationKey)},
 		{"pin", "KOLO_CHAT_PIN", "IP:PORT of the pin (default " + defaultPinAddr + ")", text(&c.PinAddr)},
 		{"pin-key", "KOLO_CHAT_PIN_KEY", "public key of the pin, in hex: the pin of the conversations you start (required with -conversation-key)", text(&c.PinKey)},
@@ -108,9 +110,9 @@ type settings struct {
 	Config
 	conversationKey [32]byte
 	pinKey          ed25519.PublicKey
-	token           []byte // nil: the app issues one
-	bootstrap       netip.AddrPort
-	inConversation  bool // the key and the pin are known: from the configuration, or later from an invite
+	token           []byte   // nil: the app issues one
+	bootstrap       []string // the entry nodes of your own network; nil is the public network
+	inConversation  bool     // the key and the pin are known: from the configuration, or later from an invite
 }
 
 // resolve applies the defaults and checks every setting, returning a *ConfigError for the first bad one.
@@ -127,8 +129,6 @@ func (c Config) resolve() (settings, error) {
 		}
 		s.DataDir = filepath.Join(dir, "kolo-chat")
 	}
-	s.Bootstrap = orDefault(s.Bootstrap, defaultBootstrap)
-	s.Listen = orDefault(s.Listen, defaultListen)
 	s.PinAddr = orDefault(s.PinAddr, defaultPinAddr)
 	if s.PinTTL == 0 {
 		s.PinTTL = defaultPinTTL
@@ -140,11 +140,22 @@ func (c Config) resolve() (settings, error) {
 		s.LookupInterval = defaultLookupInterval
 	}
 
-	boot, err := netip.ParseAddrPort(s.Bootstrap)
-	if err != nil {
-		return s, &ConfigError{Setting: "bootstrap", Err: fmt.Errorf("%w: %w", ErrMalformed, err)}
+	var err error
+	if s.Bootstrap != "" {
+		s.bootstrap, err = koloswarm.ParseNodes(s.Bootstrap)
+		switch {
+		case err != nil:
+			return s, &ConfigError{Setting: "bootstrap", Err: fmt.Errorf("%w: %w", ErrMalformed, err)}
+		case len(s.bootstrap) == 0:
+			return s, &ConfigError{Setting: "bootstrap", Err: fmt.Errorf("%w: lists no entry node", ErrMalformed)}
+		}
 	}
-	s.bootstrap = boot
+	if s.Listen == "" {
+		s.Listen = publicListen
+		if loopbackOnly(s.bootstrap) {
+			s.Listen = loopbackListen
+		}
+	}
 	if _, err := netip.ParseAddrPort(s.PinAddr); err != nil {
 		return s, &ConfigError{Setting: "pin", Err: fmt.Errorf("%w: %w", ErrMalformed, err)}
 	}
@@ -170,6 +181,19 @@ func (c Config) resolve() (settings, error) {
 		}
 	}
 	return s, nil
+}
+
+// loopbackOnly says whether every entry node is a loopback IPv4 literal, so the app can stay on 127.0.0.1.
+func loopbackOnly(nodes []string) bool {
+	if len(nodes) == 0 {
+		return false
+	}
+	for _, n := range nodes {
+		if a, err := netip.ParseAddrPort(n); err != nil || !a.Addr().IsLoopback() {
+			return false
+		}
+	}
+	return true
 }
 
 // fixedPort says whether the listen address names a port, which one socket only can hold.

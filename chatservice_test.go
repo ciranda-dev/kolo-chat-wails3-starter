@@ -445,7 +445,7 @@ func TestConfig(t *testing.T) {
 		t.Fatalf("a flag beats the environment: %+v", cfg)
 	}
 	set, err := cfg.resolve()
-	if err != nil || set.Bootstrap != defaultBootstrap || set.Listen != defaultListen || set.LookupInterval != defaultLookupInterval {
+	if err != nil || len(set.bootstrap) != 0 || set.Listen != publicListen || set.LookupInterval != defaultLookupInterval {
 		t.Fatalf("defaults: %+v, %v", set, err)
 	}
 

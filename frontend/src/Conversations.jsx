@@ -1,14 +1,16 @@
 import { useState } from 'react'
 import { Create } from "../bindings/github.com/ciranda-dev/kolo-chat-wails3-starter/conversations.js"
+import { networkLine } from './network.js'
 
 /** Turns whatever a rejected call threw into a string for the UI. */
 const errorText = (err) => (err instanceof Error && err.message ? err.message : String(err))
 
 /**
  * The column of conversations, the full height of the window: each with its unread count and a mark when one did not
- * start, then "New conversation" (a name, then Create) and "Join with an invite", which opens the join panel.
+ * start, then "New conversation" (a name, then Create) and "Join with an invite", which opens the join panel,
+ * and a line that says which network the app joins.
  */
-export function ConversationList({ rows, selected, convs, canCreate, max, count, pending, onSelect, onCreated, onJoin }) {
+export function ConversationList({ rows, selected, convs, canCreate, network, max, count, pending, onSelect, onCreated, onJoin }) {
   const [naming, setNaming] = useState(false)
   const [name, setName] = useState('')
   const [error, setError] = useState('')
@@ -65,6 +67,7 @@ export function ConversationList({ rows, selected, convs, canCreate, max, count,
         {!canCreate ? <p className="note">Start Kolo Chat with -pin-key to start a conversation. You can still join one with an invite.</p> : null}
         {full ? <p className="note">You have {max} conversations, the most this app keeps.</p> : null}
         {error ? <p className="error">{error}</p> : null}
+        <p className="note" title={network.nodes.join(', ')}>{networkLine(network)}</p>
       </div>
     </nav>
   )

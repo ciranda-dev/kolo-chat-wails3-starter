@@ -7,7 +7,8 @@
 import { Create as $Create } from "@wailsio/runtime";
 
 /**
- * AppInfo is what Start returns. CanCreate says the app has a pin, which a new conversation needs.
+ * AppInfo is what Start returns. CanCreate says the app has a pin, which a new conversation needs, and Network which
+ * network the app joins.
  */
 export class AppInfo {
     /**
@@ -36,6 +37,13 @@ export class AppInfo {
              */
             this["canCreate"] = false;
         }
+        if (!("network" in $$source)) {
+            /**
+             * @member
+             * @type {NetworkInfo}
+             */
+            this["network"] = (new NetworkInfo());
+        }
 
         Object.assign(this, $$source);
     }
@@ -47,9 +55,13 @@ export class AppInfo {
      */
     static createFrom($$source = {}) {
         const $$createField0_0 = $$createType1;
+        const $$createField3_0 = $$createType2;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("conversations" in $$parsedSource) {
             $$parsedSource["conversations"] = $$createField0_0($$parsedSource["conversations"]);
+        }
+        if ("network" in $$parsedSource) {
+            $$parsedSource["network"] = $$createField3_0($$parsedSource["network"]);
         }
         return new AppInfo(/** @type {Partial<AppInfo>} */($$parsedSource));
     }
@@ -113,6 +125,14 @@ export class ConversationInfo {
              * @type {string}
              */
             this["folder"] = "";
+        }
+        if (/** @type {any} */(false)) {
+            /**
+             * Network is "public" or "own" when the conversation did not start because no entry node of that network answered.
+             * @member
+             * @type {string | undefined}
+             */
+            this["network"] = undefined;
         }
 
         Object.assign(this, $$source);
@@ -306,6 +326,51 @@ export class Member {
     }
 }
 
+/**
+ * NetworkInfo says which network the app joins: Mode is "public" (the entry nodes built into Kolo, run by Ciranda)
+ * or "own" (the -bootstrap list), and Nodes are the entry nodes in use.
+ */
+export class NetworkInfo {
+    /**
+     * Creates a new NetworkInfo instance.
+     * @param {Partial<NetworkInfo>} [$$source = {}] - The source object to create the NetworkInfo.
+     */
+    constructor($$source = {}) {
+        if (!("mode" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["mode"] = "";
+        }
+        if (!("nodes" in $$source)) {
+            /**
+             * @member
+             * @type {string[]}
+             */
+            this["nodes"] = [];
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new NetworkInfo instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {NetworkInfo}
+     */
+    static createFrom($$source = {}) {
+        const $$createField1_0 = $$createType3;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("nodes" in $$parsedSource) {
+            $$parsedSource["nodes"] = $$createField1_0($$parsedSource["nodes"]);
+        }
+        return new NetworkInfo(/** @type {Partial<NetworkInfo>} */($$parsedSource));
+    }
+}
+
 // Private type creation functions
 const $$createType0 = ConversationInfo.createFrom;
 const $$createType1 = $Create.Array($$createType0);
+const $$createType2 = NetworkInfo.createFrom;
+const $$createType3 = $Create.Array($Create.Any);

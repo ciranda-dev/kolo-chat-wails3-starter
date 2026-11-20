@@ -7,6 +7,7 @@ import { JoinPanel, InvitePanel, Requests } from './Invite.jsx'
 import { Modal } from './Modal.jsx'
 import { ProfilePanel, Sidebar, labelFor } from './Profile.jsx'
 import { convOf, initialState, reduce, shownRows } from './conversations.js'
+import { networkFault, networkInfo, networkText } from './network.js'
 import { isAdmin, shownRooms, stateBanners } from './state.js'
 import './chat.css'
 
@@ -29,7 +30,7 @@ function errorText(err) {
 
 function App() {
   const [state, dispatch] = useReducer(reduce, initialState)
-  const [app, setApp] = useState({ maxConversations: 0, canCreate: false })
+  const [app, setApp] = useState({ maxConversations: 0, canCreate: false, network: networkInfo() })
   const [startError, setStartError] = useState('')
   const [error, setError] = useState('')
   const [room, setRoom] = useState('general')
@@ -56,7 +57,7 @@ function App() {
     offs.push(Events.On('chat:conversations', (e) => dispatch({ type: 'list', list: e.data })))
     Start()
       .then((info) => {
-        setApp({ maxConversations: info.maxConversations, canCreate: info.canCreate })
+        setApp({ maxConversations: info.maxConversations, canCreate: info.canCreate, network: networkInfo(info.network) })
         dispatch({ type: 'list', list: info.conversations })
         for (const c of shownRows(info.conversations)) {
           if (c.joined && !c.error) {
@@ -150,6 +151,7 @@ function App() {
             selected={view === 'join' ? '' : state.selected}
             convs={state.convs}
             canCreate={app.canCreate}
+            network={app.network}
             max={app.maxConversations}
             count={state.list.length}
             pending={Boolean(pending)}
@@ -173,7 +175,14 @@ function App() {
           {view === 'failed' ? (
             <div className="panel panel--center">
               <h2 className="panel__title">This conversation could not start.</h2>
-              <p className="error">{row.error}</p>
+              {networkFault(row) ? (
+                <>
+                  <p className="error">{networkFault(row)}</p>
+                  <p className="note">{networkText('network.options')}</p>
+                </>
+              ) : (
+                <p className="error">{row.error}</p>
+              )}
               {row.folder ? <p className="note">Its folder: <code>{row.folder}</code></p> : null}
             </div>
           ) : null}
