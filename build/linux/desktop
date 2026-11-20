@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Kolo Chat
+Comment=Peer-to-peer desktop chat built with Kolo
+Exec=kolo-chat %u
+Icon=kolo-chat
+Terminal=false
+Categories=Network;Chat;
+StartupWMClass=kolo-chat
