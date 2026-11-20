@@ -6,3 +6,8 @@ import * as ChatService from "./chatservice.js";
 export {
     ChatService
 };
+
+export {
+    InviteInfo,
+    InviteOptions
+} from "./models.js";

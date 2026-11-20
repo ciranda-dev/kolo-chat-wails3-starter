@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/ciranda-dev/kolo-dht v0.1.0
 	github.com/ciranda-dev/kolo-id v0.1.0
+	github.com/ciranda-dev/kolo-invite v0.1.0
 	github.com/ciranda-dev/kolo-log v0.1.0
 	github.com/ciranda-dev/kolo-pin v0.1.0
 	github.com/ciranda-dev/kolo-secure v0.1.0

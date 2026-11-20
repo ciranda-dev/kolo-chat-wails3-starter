@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
-import { Start, Send } from "../bindings/github.com/ciranda-dev/kolo-chat-wails3-starter/chatservice.js"
+import { Start, Send, Joined } from "../bindings/github.com/ciranda-dev/kolo-chat-wails3-starter/chatservice.js"
 import { Events } from "@wailsio/runtime"
 import logo from './assets/kolo-mark.svg'
+import { JoinPanel, InvitePanel, Requests } from './Invite.jsx'
 import './chat.css'
 import { appendMessage } from './messages.js'
 
@@ -29,18 +30,35 @@ function App() {
   const [peers, setPeers] = useState(0)
   const [pin, setPin] = useState({ error: '', locked: 0 })
   const [failed, setFailed] = useState(false)
+  const [joined, setJoined] = useState(/** @type {boolean | null} */ (null)) // null until the app says
+  const [inviting, setInviting] = useState(false)
+  const [requests, setRequests] = useState([])
   const status = failed ? 'error' : peers > 0 ? 'live' : 'waiting'
   const bottomRef = useRef(null)
   const nextId = useRef(1)
 
   useEffect(() => {
     Start()
-      .then((id) => setMe(id))
+      .then((id) => {
+        setMe(id)
+        return Joined()
+      })
+      .then((yes) => setJoined(yes))
       .catch((err) => {
         setFailed(true)
         setError(errorText(err))
       })
     const offPeers = Events.On("chat:peers", (e) => setPeers(Number(e.data) || 0))
+    const offRequest = Events.On("chat:invite-request", (e) => {
+      const r = e.data
+      if (!r) {
+        return
+      }
+      setRequests((prev) => {
+        const rest = prev.filter((x) => x.request !== r.request)
+        return r.withdrawn ? rest : [...rest, r]
+      })
+    })
     const offPin = Events.On("chat:pin", (e) => setPin({ error: e.data?.error ?? '', locked: e.data?.locked ?? 0 }))
     const off = Events.On("chat:msg", e => {
       const data = e.data
@@ -52,6 +70,7 @@ function App() {
     return () => {
       off()
       offPeers()
+      offRequest()
       offPin()
     }
   }, [])
@@ -94,28 +113,40 @@ function App() {
             you · {shortId(me)}
           </span>
         ) : null}
+        {joined ? (
+          <button type="button" className="header__btn" onClick={() => setInviting((open) => !open)}>
+            Invite{requests.length > 0 ? ` (${requests.length})` : ''}
+          </button>
+        ) : null}
         <span className={`header__badge is-${status}`}>{badge}</span>
       </header>
 
-      <div className="messages" role="log" aria-live="polite">
-        {messages.length === 0 ? (
-          <p className="empty">No messages yet. Open a second window and say hi.</p>
-        ) : (
-          messages.map((msg) => (
-            <div key={msg.id} className={`row ${msg.mine ? 'is-mine' : 'is-theirs'}`}>
-              <div className="msg">
-                <span className="msg__from" title={msg.from}>
-                  {msg.mine ? 'you' : shortId(msg.from) || 'peer'}
-                  {msg.via === 'pin' ? <span className="msg__via"> · synced from pin</span> : null}
-                </span>
-                <div className="bubble">{msg.text}</div>
-              </div>
-            </div>
-          ))
-        )}
-        <div ref={bottomRef} />
-      </div>
+      {joined && inviting ? <InvitePanel /> : null}
 
+      {joined === false ? (
+        <JoinPanel onJoined={() => setJoined(true)} />
+      ) : (
+        <div className="messages" role="log" aria-live="polite">
+          {messages.length === 0 ? (
+            <p className="empty">No messages yet. Open a second window and say hi.</p>
+          ) : (
+            messages.map((msg) => (
+              <div key={msg.id} className={`row ${msg.mine ? 'is-mine' : 'is-theirs'}`}>
+                <div className="msg">
+                  <span className="msg__from" title={msg.from}>
+                    {msg.mine ? 'you' : shortId(msg.from) || 'peer'}
+                    {msg.via === 'pin' ? <span className="msg__via"> · synced from pin</span> : null}
+                  </span>
+                  <div className="bubble">{msg.text}</div>
+                </div>
+              </div>
+            ))
+          )}
+          <div ref={bottomRef} />
+        </div>
+      )}
+
+      <Requests requests={requests} />
       {error ? <p className="error">{error}</p> : null}
       {pin.error ? <p className="error">{pin.error}</p> : null}
       {!pin.error && pin.locked > 0 ? (
@@ -124,24 +155,26 @@ function App() {
         </p>
       ) : null}
 
-      <form
-        className="composer"
-        onSubmit={(ev) => {
-          ev.preventDefault()
-          send()
-        }}
-      >
-        <input
-          className="composer__input"
-          aria-label="Message"
-          value={draft}
-          onChange={(ev) => setDraft(ev.target.value)}
-          type="text"
-          placeholder="Message"
-          autoComplete="off"
-        />
-        <button type="submit" className="composer__send">Send</button>
-      </form>
+      {joined ? (
+        <form
+          className="composer"
+          onSubmit={(ev) => {
+            ev.preventDefault()
+            send()
+          }}
+        >
+          <input
+            className="composer__input"
+            aria-label="Message"
+            value={draft}
+            onChange={(ev) => setDraft(ev.target.value)}
+            type="text"
+            placeholder="Message"
+            autoComplete="off"
+          />
+          <button type="submit" className="composer__send">Send</button>
+        </form>
+      ) : null}
     </div>
   )
 }

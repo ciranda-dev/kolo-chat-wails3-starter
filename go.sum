@@ -18,6 +18,8 @@ github.com/ciranda-dev/kolo-dht v0.1.0 h1:EJr2Iv8cSpdVx6NFOKuvSDgH4eiWJ8jNO5tagF
 github.com/ciranda-dev/kolo-dht v0.1.0/go.mod h1:i8qYSt34hvC3JcQoC3S2gXpHk0Bc+MKXE1xG9UwoqlE=
 github.com/ciranda-dev/kolo-id v0.1.0 h1:h7kCrm4W71gLdM41D1hh5gqEyi36nG+4fchh3TL3HJo=
 github.com/ciranda-dev/kolo-id v0.1.0/go.mod h1:UBOurs+UF4Vk2ZZET2BHu04Y38QWelxw2c5EPqLd47g=
+github.com/ciranda-dev/kolo-invite v0.1.0 h1:B08T+pvs/0cDRScz5+4NJxVYwYzyLgdavKOejS8GbNg=
+github.com/ciranda-dev/kolo-invite v0.1.0/go.mod h1:0XUm9R6b5Zim0vT2QFa+KtlQwgqzPn9Rt/em43HKzhE=
 github.com/ciranda-dev/kolo-kv v0.1.0 h1:tPLxy8ogfGCTR42cn6CEgKUkGc7Op59NGHuvxEA82Tc=
 github.com/ciranda-dev/kolo-kv v0.1.0/go.mod h1:WmOngIriSAFzbNCcpKNj25fd+4C/xS2jnZbKH6PndZE=
 github.com/ciranda-dev/kolo-log v0.1.0 h1:cYszZoFn6fOWeWZcpirCekuvOZCH68iE/FIXBRAuF44=

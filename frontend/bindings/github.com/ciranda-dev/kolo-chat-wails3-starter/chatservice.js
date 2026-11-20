@@ -6,6 +6,89 @@
 // @ts-ignore: Unused imports
 import { Call as $Call, CancellablePromise as $CancellablePromise, Create as $Create } from "@wailsio/runtime";
 
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore: Unused imports
+import * as $models from "./models.js";
+
+/**
+ * Approve lets in the person behind a request, giving it the conversation through the invite. Deny refuses it.
+ * @param {number} request
+ * @returns {$CancellablePromise<void>}
+ */
+export function Approve(request) {
+    return $Call.ByID(3116380520, request);
+}
+
+/**
+ * CancelJoin stops a Join that waits, for the inviter or for its answer.
+ * @returns {$CancellablePromise<void>}
+ */
+export function CancelJoin() {
+    return $Call.ByID(136286777);
+}
+
+/**
+ * CreateInvite makes an invite for the conversation and returns it with its code, which the owner gives to the
+ * person to invite. Without RequireApproval the first joiners to use it are accepted at once, up to Uses.
+ * @param {$models.InviteOptions} opts
+ * @returns {$CancellablePromise<$models.InviteInfo>}
+ */
+export function CreateInvite(opts) {
+    return $Call.ByID(2398512558, opts).then(/** @type {($result: any) => any} */(($result) => {
+        return $$createType0($result);
+    }));
+}
+
+/**
+ * @param {number} request
+ * @returns {$CancellablePromise<void>}
+ */
+export function Deny(request) {
+    return $Call.ByID(3791770185, request);
+}
+
+/**
+ * Invites lists the invites, oldest first, ended ones included. It has no codes.
+ * @returns {$CancellablePromise<$models.InviteInfo[]>}
+ */
+export function Invites() {
+    return $Call.ByID(3557629047).then(/** @type {($result: any) => any} */(($result) => {
+        return $$createType1($result);
+    }));
+}
+
+/**
+ * Join uses an invite code: it finds the inviter on the invite's topic, asks to join, and waits for the answer,
+ * which for an invite that needs approval is a person's. With the answer it takes the conversation key and the
+ * pin from the payload of the accept, keeps them in the data directory, and joins the conversation like an owner
+ * that started with them. A refusal comes back as an *InviteError whose Message is the sentence to show and
+ * whose cause is an error of kolo-invite: ErrDenied, ErrExpired, ErrUsedUp, ErrRevoked, ErrInvalidCode,
+ * ErrInvalid, ErrUnreachable and the like.
+ * @param {string} text
+ * @returns {$CancellablePromise<void>}
+ */
+export function Join(text) {
+    return $Call.ByID(1447697859, text);
+}
+
+/**
+ * Joined says whether this chat is in a conversation: it started with a conversation key, or joined with an invite.
+ * @returns {$CancellablePromise<boolean>}
+ */
+export function Joined() {
+    return $Call.ByID(2043877634);
+}
+
+/**
+ * Revoke ends an invite: a joiner that uses its code from now on is refused, and the requests that wait for an
+ * answer are refused too. Members that joined stay.
+ * @param {string} id
+ * @returns {$CancellablePromise<void>}
+ */
+export function Revoke(id) {
+    return $Call.ByID(3624414281, id);
+}
+
 /**
  * Send seals the text with the conversation key and appends it to our log. Then it hands it to every peer
  * that is connected, and to the pin for those who are not. A pin that fails never fails the Send.
@@ -26,3 +109,7 @@ export function Send(text) {
 export function Start() {
     return $Call.ByID(1684626897);
 }
+
+// Private type creation functions
+const $$createType0 = $models.InviteInfo.createFrom;
+const $$createType1 = $Create.Array($$createType0);

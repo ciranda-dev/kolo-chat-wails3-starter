@@ -22,6 +22,7 @@ import (
 	"time"
 
 	koloid "github.com/ciranda-dev/kolo-id"
+	invite "github.com/ciranda-dev/kolo-invite"
 	kololog "github.com/ciranda-dev/kolo-log"
 	kolosecure "github.com/ciranda-dev/kolo-secure"
 	kolostore "github.com/ciranda-dev/kolo-store"
@@ -92,16 +93,22 @@ type ChatService struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
-	push    chan struct{} // a push to the pin is wanted
-	pinDone chan struct{} // closed when the pull from the pin at start is over
+	push    chan struct{}     // a push to the pin is wanted
+	pinDone chan struct{}     // closed when the pull from the pin at start is over
+	invDB   kolostore.Backend // the invites' own store, used for nothing else
+	inv     *invite.Inviter
 
-	mu       sync.Mutex // guards the fields below
-	peers    map[string]*koloswarm.Peer
-	members  map[string]*member
-	replicas map[string]*kolostore.Replica
-	pinned   map[string]uint64 // per author: entries below this index came from the pin
-	locked   map[string]int    // per author: entries that wait for a key
-	pin      pinState
+	mu         sync.Mutex // guards the fields below
+	peers      map[string]*koloswarm.Peer
+	members    map[string]*member
+	replicas   map[string]*kolostore.Replica
+	pinned     map[string]uint64 // per author: entries below this index came from the pin
+	locked     map[string]int    // per author: entries that wait for a key
+	pin        pinState
+	active     bool                              // in a conversation: it has its key and its pin
+	joining    *joinAttempt                      // the Join that waits for its inviter
+	cancelJoin context.CancelFunc                // stops that Join
+	requests   map[invite.RequestID]invite.Event // the requests that wait for Approve or Deny
 
 	showMu sync.Mutex // one message is shown at a time, so they keep their order
 	pullMu sync.Mutex // one pull at a time, since a replica takes one
@@ -141,18 +148,12 @@ func (c *ChatService) start() (err error) {
 		return err
 	}
 	c.pub = c.id.PublicKey()
-	if c.aead, err = chacha20poly1305.NewX(c.set.conversationKey[:]); err != nil {
-		return err
-	}
 	backend, err := kolostore.OpenPebble(filepath.Join(c.set.DataDir, "store"))
 	if err != nil {
 		return err
 	}
 	c.store = kolostore.New(backend)
 	if c.log, err = openOwnLog(c.store, c.id); err != nil {
-		return err
-	}
-	if c.token, err = capability(c.set, c.id, c.log.ID()); err != nil {
 		return err
 	}
 	c.peers = map[string]*koloswarm.Peer{}
@@ -162,14 +163,10 @@ func (c *ChatService) start() (err error) {
 	if c.members, err = loadMembers(c.set.DataDir); err != nil {
 		return err
 	}
-	c.srv = kolosync.NewServer(c.authorize)
-	if err = c.srv.Offer(c.log); err != nil {
-		return err
-	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.push = make(chan struct{}, 1)
-	c.pinDone = make(chan struct{})
-	if c.sw, err = koloswarm.New(c.ctx, c.set.Listen, c.id, &koloswarm.Config{LookupInterval: c.set.LookupInterval}); err != nil {
+	swarmCfg := &koloswarm.Config{LookupInterval: c.set.LookupInterval, MaxTopics: swarmTopics}
+	if c.sw, err = koloswarm.New(c.ctx, c.set.Listen, c.id, swarmCfg); err != nil {
 		return err
 	}
 	if err = c.sw.Bootstrap(c.ctx, []netip.AddrPort{c.set.bootstrap}); err != nil {
@@ -178,6 +175,36 @@ func (c *ChatService) start() (err error) {
 	log.Print("kolo-id ", c.id.PublicKeyString())
 
 	c.wg.Go(c.swarmLoop)
+	if err = c.openInvites(); err != nil {
+		return err
+	}
+	conv, found, err := c.savedConversation() // from the configuration, or from the invite that made us a member
+	if err != nil || !found {
+		return err // a joiner waits for Join
+	}
+	return c.enter(conv)
+}
+
+// enter makes this chat a member of the conversation: it has the key and the pin, offers its log, pulls from the
+// pin first and then from the peers, and joins the conversation's topic. Start calls it for an owner or a member
+// that joined earlier, and Join for a new member.
+func (c *ChatService) enter(conv conversation) (err error) {
+	c.set.useConversation(conv)
+	if c.aead, err = chacha20poly1305.NewX(c.set.conversationKey[:]); err != nil {
+		return err
+	}
+	if c.token, err = capability(c.set, c.id, c.log.ID()); err != nil {
+		return err
+	}
+	c.srv = kolosync.NewServer(c.authorize)
+	if err = c.srv.Offer(c.log); err != nil {
+		return err
+	}
+	c.pinDone = make(chan struct{})
+	c.mu.Lock()
+	c.active = true // what the goroutines below read was written before this
+	c.mu.Unlock()
+
 	c.wg.Go(c.pushLoop)
 	c.wg.Go(func() { // on open: the pin first, then the peers
 		defer close(c.pinDone)
@@ -210,11 +237,20 @@ func (c *ChatService) shutdown() error {
 	if c.sw != nil {
 		errs = append(errs, c.sw.Close())
 	}
+	if c.inv != nil {
+		errs = append(errs, c.inv.Close())
+	}
 	c.wg.Wait()
 	if c.store != nil {
 		errs = append(errs, c.store.Close()) // also closes the log and the replicas
 	}
-	c.id, c.store, c.sw, c.cancel = nil, nil, nil, nil
+	if c.invDB != nil {
+		errs = append(errs, c.invDB.Close())
+	}
+	c.mu.Lock()
+	c.active, c.joining, c.cancelJoin = false, nil, nil
+	c.mu.Unlock()
+	c.id, c.store, c.sw, c.cancel, c.inv, c.invDB = nil, nil, nil, nil, nil, nil
 	return errors.Join(errs...)
 }
 
@@ -224,7 +260,7 @@ func (c *ChatService) topic() koloswarm.Topic {
 	return sha256.Sum256(append([]byte("kolochat/topic/v1"), c.set.conversationKey[:]...))
 }
 
-// swarmLoop connects to every peer the swarm finds.
+// swarmLoop handles every peer the swarm connects.
 func (c *ChatService) swarmLoop() {
 	for {
 		ev, err := c.sw.Next(c.ctx)
@@ -235,8 +271,22 @@ func (c *ChatService) swarmLoop() {
 			return
 		}
 		if ev.Kind == koloswarm.Connected && ev.Peer != nil {
-			c.addPeer(ev.Peer)
+			c.route(ev.Peer)
 		}
+	}
+}
+
+// route decides what a connection is for, since one protocol serves it: the inviter that a Join waits for, a
+// peer of the conversation (chat and sync), or a person that has only an invite's topic with us, whose
+// requests the inviter answers.
+func (c *ChatService) route(p *koloswarm.Peer) {
+	switch {
+	case c.offerToJoin(p):
+	case !c.isActive():
+	case slices.Contains(p.Topics(), c.topic()):
+		c.addPeer(p)
+	default:
+		c.wg.Go(func() { c.inv.ServePeer(c.ctx, p) })
 	}
 }
 
@@ -321,6 +371,9 @@ func (c *ChatService) Send(text string) error {
 	}
 	if c.log == nil {
 		return errors.New("not started")
+	}
+	if !c.isActive() {
+		return ErrNotInConversation
 	}
 	sealed, err := c.seal(text)
 	if err != nil {

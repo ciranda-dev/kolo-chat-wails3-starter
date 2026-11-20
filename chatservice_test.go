@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -21,11 +22,16 @@ import (
 
 const testKey = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 
-// events records what a ChatService tells the window.
+// events records what a ChatService tells the window. all keeps every event as JSON, for the checks that
+// something never shows up in one.
 type events struct {
-	mu   sync.Mutex
-	msgs []ChatMsg
-	pins []PinStatus
+	mu       sync.Mutex
+	msgs     []ChatMsg
+	pins     []PinStatus
+	requests []InviteRequest
+	joins    []JoinStatus
+	invites  []InviteInfo
+	all      []string
 }
 
 func (e *events) emit(name string, data any) {
@@ -36,6 +42,15 @@ func (e *events) emit(name string, data any) {
 		e.msgs = append(e.msgs, v)
 	case PinStatus:
 		e.pins = append(e.pins, v)
+	case InviteRequest:
+		e.requests = append(e.requests, v)
+	case JoinStatus:
+		e.joins = append(e.joins, v)
+	case InviteInfo:
+		e.invites = append(e.invites, v)
+	}
+	if b, err := json.Marshal(data); err == nil {
+		e.all = append(e.all, name+" "+string(b))
 	}
 }
 
