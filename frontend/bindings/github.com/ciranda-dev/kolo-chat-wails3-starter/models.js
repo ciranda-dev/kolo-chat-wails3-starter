@@ -126,3 +126,57 @@ export class InviteOptions {
         return new InviteOptions(/** @type {Partial<InviteOptions>} */($$parsedSource));
     }
 }
+
+/**
+ * Member is a member of the conversation as the window shows it. Name and Avatar are empty until the member's
+ * profile has been read.
+ */
+export class Member {
+    /**
+     * Creates a new Member instance.
+     * @param {Partial<Member>} [$$source = {}] - The source object to create the Member.
+     */
+    constructor($$source = {}) {
+        if (!("key" in $$source)) {
+            /**
+             * the member's kolo-id, hex
+             * @member
+             * @type {string}
+             */
+            this["key"] = "";
+        }
+        if (!("name" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["name"] = "";
+        }
+        if (!("avatar" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["avatar"] = "";
+        }
+        if (!("owner" in $$source)) {
+            /**
+             * @member
+             * @type {boolean}
+             */
+            this["owner"] = false;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new Member instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {Member}
+     */
+    static createFrom($$source = {}) {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new Member(/** @type {Partial<Member>} */($$parsedSource));
+    }
+}

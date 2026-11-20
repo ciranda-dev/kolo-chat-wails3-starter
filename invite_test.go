@@ -147,7 +147,7 @@ func TestInviteJoinAndChat(t *testing.T) {
 	if b.Joined() || !a.Joined() {
 		t.Fatal("only the owner starts in a conversation")
 	}
-	if err := b.Send("anyone?"); !errors.Is(err, ErrNotInConversation) {
+	if err := b.Send(defaultRoom, "anyone?"); !errors.Is(err, ErrNotInConversation) {
 		t.Fatalf("got %v", err)
 	}
 	if _, err := b.CreateInvite(InviteOptions{}); !errors.Is(err, ErrNotInConversation) {
@@ -252,14 +252,14 @@ func TestInviteJoinAndChat(t *testing.T) {
 
 	// B and the owner talk, directly.
 	linked(t, a, b)
-	if err := a.Send("hello b"); err != nil {
+	if err := a.Send(defaultRoom, "hello b"); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "the message to B", func() bool { return len(bev.messages()) == 1 })
 	if m := bev.messages()[0]; m.Text != "hello b" || m.Via != "direct" || m.From != a.id.PublicKeyString() {
 		t.Fatalf("got %+v", m)
 	}
-	if err := b.Send("hello a"); err != nil {
+	if err := b.Send(defaultRoom, "hello a"); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "the message to the owner", func() bool { return len(aev.messages()) == 1 })
@@ -272,8 +272,8 @@ func TestInviteJoinAndChat(t *testing.T) {
 	if err := b.ServiceShutdown(); err != nil {
 		t.Fatal(err)
 	}
-	a.Send("two")
-	a.Send("three")
+	a.Send(defaultRoom, "two")
+	a.Send(defaultRoom, "three")
 	eventually(t, "the pin to hold three entries", func() bool { return pinned(t, n, a).Entries == 3 })
 	b2, b2ev := start(t, n.joiner(bdir))
 	if !b2.Joined() {
@@ -289,7 +289,7 @@ func TestInviteJoinAndChat(t *testing.T) {
 		t.Fatalf("each message shows once, in order, got %v", texts(got))
 	}
 	linked(t, a, b2)
-	a.Send("four")
+	a.Send(defaultRoom, "four")
 	eventually(t, "the next message", func() bool { return len(b2ev.messages()) == 3 })
 	if m := b2ev.messages()[2]; m.Text != "four" || m.Via != "direct" {
 		t.Fatalf("got %+v", m)
@@ -302,7 +302,7 @@ func TestInviteJoinAndChat(t *testing.T) {
 		t.Fatal(err)
 	}
 	linked(t, a, c)
-	if err := c.Send("hi from c"); err != nil {
+	if err := c.Send(defaultRoom, "hi from c"); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "the message from C", func() bool { return len(aev.messages()) == 2 })

@@ -82,11 +82,14 @@ func (e *InviteError) Unwrap() error { return e.Err }
 // ErrNotInConversation is returned by what needs a conversation before the user has joined one.
 var ErrNotInConversation = errors.New("Join a conversation first: paste an invite code.")
 
-// conversation is what makes a member: the key, and where the pin is. It is kept in conversation.json.
+// conversation is what makes a member: the key, where the pin is, and who the owner is. It is kept in
+// conversation.json. Owner is the key that writes the room list and the member list (see profile.go): ours for
+// the owner, and for a joiner the key of the member that invited it, saved here. A file from step 4 has none.
 type conversation struct {
 	Key     []byte `json:"key"`
 	PinAddr string `json:"pinAddr"`
 	PinKey  []byte `json:"pinKey"`
+	Owner   []byte `json:"owner,omitempty"`
 }
 
 // grant is the payload of an accept. The invite encrypts it for the joiner alone (HPKE), and nothing else
@@ -101,7 +104,7 @@ type grant struct {
 
 // check says whether the conversation is complete: a key, and a pin that can be dialed.
 func (v conversation) check() error {
-	if len(v.Key) != 32 || len(v.PinKey) != ed25519.PublicKeySize {
+	if len(v.Key) != 32 || len(v.PinKey) != ed25519.PublicKeySize || len(v.Owner) != 0 && len(v.Owner) != ed25519.PublicKeySize {
 		return errors.New("wrong key size")
 	}
 	_, err := netip.ParseAddrPort(v.PinAddr)
@@ -233,6 +236,7 @@ func (c *ChatService) grantPayload() ([]byte, error) {
 			Key:     c.set.conversationKey[:],
 			PinAddr: c.set.PinAddr,
 			PinKey:  c.set.pinKey,
+			Owner:   c.ownerKey(), // the inviter's own key if it is the owner, else the owner it knows
 		},
 		Header: c.log.Header().Encode(),
 	})
@@ -288,7 +292,7 @@ func (c *ChatService) onJoined(ev invite.Event) {
 	c.mu.Unlock()
 	header, err := joinerHeader(ev.Joiner, ev.Data)
 	if err == nil {
-		err = c.addMember(ev.Joiner, header)
+		err = c.addMember(ev.Joiner, header, nil)
 	}
 	if err != nil {
 		log.Print("invite joiner: ", err)
@@ -463,12 +467,16 @@ func readGrant(payload []byte, owner ed25519.PublicKey) (g grant, err error) {
 }
 
 // becomeMember keeps the conversation the invite gave and enters it. It is saved first: the payload is the only
-// copy the joiner has, and a restart finds it and goes on.
-func (c *ChatService) becomeMember(g grant, owner ed25519.PublicKey) error {
+// copy the joiner has, and a restart finds it and goes on. The owner is the member that invited us, unless it
+// names the owner, which it can because any member may invite.
+func (c *ChatService) becomeMember(g grant, inviter ed25519.PublicKey) error {
+	if len(g.Owner) == 0 {
+		g.Owner = slices.Clone(inviter)
+	}
 	if err := saveConversation(c.set.DataDir, g.conversation); err != nil {
 		return err
 	}
-	if err := c.addMember(owner, g.Header); err != nil {
+	if err := c.addMember(inviter, g.Header, nil); err != nil {
 		return err
 	}
 	return c.enter(g.conversation)
@@ -484,10 +492,13 @@ func (c *ChatService) savedConversation() (conversation, bool, error) {
 	if !c.set.inConversation {
 		return saved, found, nil
 	}
-	mine := conversation{Key: slices.Clone(c.set.conversationKey[:]), PinAddr: c.set.PinAddr, PinKey: slices.Clone(c.set.pinKey)}
+	mine := conversation{Key: slices.Clone(c.set.conversationKey[:]), PinAddr: c.set.PinAddr, PinKey: slices.Clone(c.set.pinKey), Owner: slices.Clone(c.pub)}
 	if found && !slices.Equal(saved.Key, mine.Key) {
 		err := errors.New("is not the conversation this data directory joined with an invite: use another -data")
 		return mine, false, &ConfigError{Setting: "conversation-key", Err: err}
+	}
+	if found {
+		mine.Owner = saved.Owner // a member that also has the key is still a member
 	}
 	return mine, true, nil
 }

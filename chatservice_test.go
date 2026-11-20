@@ -31,6 +31,8 @@ type events struct {
 	requests []InviteRequest
 	joins    []JoinStatus
 	invites  []InviteInfo
+	profiles [][]Member
+	rooms    [][]string
 	all      []string
 }
 
@@ -48,6 +50,10 @@ func (e *events) emit(name string, data any) {
 		e.joins = append(e.joins, v)
 	case InviteInfo:
 		e.invites = append(e.invites, v)
+	case []Member:
+		e.profiles = append(e.profiles, v)
+	case []string:
+		e.rooms = append(e.rooms, v)
 	}
 	if b, err := json.Marshal(data); err == nil {
 		e.all = append(e.all, name+" "+string(b))
@@ -200,7 +206,7 @@ func TestDirectDeliveryAlsoWritesLogAndPin(t *testing.T) {
 	b, bev := start(t, n.config(dataDir(t)))
 	introduced(t, a, b)
 
-	if err := a.Send("hello"); err != nil {
+	if err := a.Send(defaultRoom, "hello"); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "the direct message", func() bool { return len(bev.messages()) == 1 })
@@ -215,8 +221,8 @@ func TestDirectDeliveryAlsoWritesLogAndPin(t *testing.T) {
 	if err != nil || strings.Contains(string(stored), "hello") {
 		t.Fatalf("the entry must hold sealed text, got %q, %v", stored, err)
 	}
-	if text, err := a.open(a.pub, stored); err != nil || text != "hello" {
-		t.Fatalf("open: %q, %v", text, err)
+	if room, text, err := a.open(a.pub, stored); err != nil || text != "hello" || room != defaultRoom {
+		t.Fatalf("open: %q, %q, %v", room, text, err)
 	}
 	eventually(t, "the pin to hold the entry", func() bool { return pinned(t, n, a).Entries == 1 })
 
@@ -235,14 +241,14 @@ func TestMissedMessagesComeFromThePin(t *testing.T) {
 	b, bev := start(t, n.config(bdir))
 	introduced(t, a, b)
 
-	a.Send("one")
+	a.Send(defaultRoom, "one")
 	eventually(t, "the direct message", func() bool { return len(bev.messages()) == 1 })
 	if err := b.ServiceShutdown(); err != nil {
 		t.Fatal(err)
 	}
 
-	a.Send("two")
-	a.Send("three")
+	a.Send(defaultRoom, "two")
+	a.Send(defaultRoom, "three")
 	eventually(t, "the pin to hold three entries", func() bool { return pinned(t, n, a).Entries == 3 })
 
 	b2, b2ev := start(t, n.config(bdir)) // same data directory, so the same identity and the same members
@@ -261,7 +267,7 @@ func TestMissedMessagesComeFromThePin(t *testing.T) {
 
 	// Live again: the next message arrives directly, once.
 	introduced(t, a, b2)
-	a.Send("four")
+	a.Send(defaultRoom, "four")
 	eventually(t, "the direct message", func() bool { return len(b2ev.messages()) == 3 })
 	if m := b2ev.messages()[2]; m.Text != "four" || m.Via != "direct" {
 		t.Fatalf("got %+v", m)
@@ -278,7 +284,7 @@ func TestPinnedMessagesWaitForTheSendersKey(t *testing.T) {
 	introduced(t, a, b)
 	b.ServiceShutdown()
 
-	a.Send("while you were away")
+	a.Send(defaultRoom, "while you were away")
 	eventually(t, "the pin to hold the entry", func() bool { return pinned(t, n, a).Entries == 1 })
 	a.ServiceShutdown()
 
@@ -352,7 +358,7 @@ func TestPinRefusesUnknownOwner(t *testing.T) {
 	b, bev := start(t, n.config(dataDir(t)))
 	introduced(t, a, b)
 
-	a.Send("still direct")
+	a.Send(defaultRoom, "still direct")
 	if err := a.pushToPin(context.Background()); !errors.Is(err, pin.ErrUnauthorized) {
 		t.Fatalf("got %v", err)
 	}
@@ -379,7 +385,7 @@ func TestExpiredTokenIsReported(t *testing.T) {
 	}
 
 	time.Sleep(3 * time.Second)
-	a.Send("too late for the pin")
+	a.Send(defaultRoom, "too late for the pin")
 	if err := a.pushToPin(context.Background()); !errors.Is(err, pin.ErrExpired) {
 		t.Fatalf("got %v", err)
 	}
@@ -400,7 +406,7 @@ func TestQuotaFullIsReported(t *testing.T) {
 
 	const total = 12
 	for i := 0; i < total; i++ {
-		if err := a.Send("a message that takes some room"); err != nil {
+		if err := a.Send(defaultRoom, "a message that takes some room"); err != nil {
 			t.Fatal(err)
 		}
 	}

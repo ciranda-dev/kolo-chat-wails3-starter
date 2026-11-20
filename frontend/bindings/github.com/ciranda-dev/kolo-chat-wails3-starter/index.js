@@ -9,5 +9,6 @@ export {
 
 export {
     InviteInfo,
-    InviteOptions
+    InviteOptions,
+    Member
 } from "./models.js";

@@ -23,6 +23,7 @@ import (
 
 	koloid "github.com/ciranda-dev/kolo-id"
 	invite "github.com/ciranda-dev/kolo-invite"
+	kolokv "github.com/ciranda-dev/kolo-kv"
 	kololog "github.com/ciranda-dev/kolo-log"
 	kolosecure "github.com/ciranda-dev/kolo-secure"
 	kolostore "github.com/ciranda-dev/kolo-store"
@@ -38,11 +39,12 @@ const (
 	codeTooLong = 1
 )
 
-// ChatMsg is the payload of the "chat:msg" event. From is the sender's kolo-id (hex public key) and Via says how
+// ChatMsg is the payload of the "chat:msg" event. From is the sender's kolo-id (hex public key), Room is the room it was sent to and Via says how
 // the message arrived: "direct" from the sender, "pin" when its ciphertext came from the pin, "peer" when it was
 // pulled from the sender after the direct delivery was missed.
 type ChatMsg struct {
 	From string `json:"from"`
+	Room string `json:"room"`
 	Text string `json:"text"`
 	Via  string `json:"via"`
 }
@@ -56,19 +58,23 @@ type PinStatus struct {
 
 // wireMsg is what peers send each other on the direct connection, one unidirectional stream each.
 type wireMsg struct {
-	Kind   string `json:"kind"`             // "hello" or "msg"
-	Header []byte `json:"header,omitempty"` // hello: the sender's signed log header
-	Proof  []byte `json:"proof,omitempty"`  // hello: proves the sender knows the conversation key
-	Reply  bool   `json:"reply,omitempty"`  // hello: answers a hello, so the sender has registered us
-	Index  uint64 `json:"index,omitempty"`  // msg: the entry's index in the sender's log
-	Sealed []byte `json:"sealed,omitempty"` // msg: the entry's value, the text sealed with the conversation key
+	Kind      string `json:"kind"`                // "hello", "msg" or "dir"
+	Header    []byte `json:"header,omitempty"`    // hello: the sender's signed log header
+	DirHeader []byte `json:"dirHeader,omitempty"` // hello: the signed header of the sender's directory log
+	Proof     []byte `json:"proof,omitempty"`     // hello: proves the sender knows the conversation key
+	Reply     bool   `json:"reply,omitempty"`     // hello: answers a hello, so the sender has registered us
+	Index     uint64 `json:"index,omitempty"`     // msg: the entry's index in the sender's log
+	Sealed    []byte `json:"sealed,omitempty"`    // msg: the entry's value, the text sealed with the conversation key
+	// "dir" has no fields: the sender's directory changed, pull it.
 }
 
-// member is a peer of the conversation: its signed log header, which names its public key and log ID, and how
-// many of its messages the window has shown. Both are kept in the data directory.
+// member is a peer of the conversation: its signed log header, which names its public key and log ID, the signed
+// header of its directory log (see profile.go), and how many of its messages the window has shown. All are kept
+// in the data directory.
 type member struct {
-	Header []byte `json:"header"`
-	Shown  uint64 `json:"shown"`
+	Header    []byte `json:"header"`
+	DirHeader []byte `json:"dirHeader,omitempty"`
+	Shown     uint64 `json:"shown"`
 }
 
 type pinState struct {
@@ -87,7 +93,9 @@ type ChatService struct {
 	aead    cipher.AEAD
 	token   []byte
 	store   *kolostore.Store
-	log     *kolostore.Log // our own log, the only one we write
+	log     *kolostore.Log // our own log of messages, one of the two we write
+	dirLog  *kolostore.Log // our directory log, the other one (see profile.go)
+	dir     *kolokv.DB     // the key-value store on dirLog: the only writer of it
 	srv     *kolosync.Server
 	sw      *koloswarm.Swarm
 	ctx     context.Context
@@ -97,13 +105,18 @@ type ChatService struct {
 	pinDone chan struct{}     // closed when the pull from the pin at start is over
 	invDB   kolostore.Backend // the invites' own store, used for nothing else
 	inv     *invite.Inviter
+	dirMu   sync.Mutex // one write of our directory at a time
+	pubMu   sync.Mutex // one publication of the directory to the window at a time
 
 	mu         sync.Mutex // guards the fields below
 	peers      map[string]*koloswarm.Peer
 	members    map[string]*member
 	replicas   map[string]*kolostore.Replica
-	pinned     map[string]uint64 // per author: entries below this index came from the pin
-	locked     map[string]int    // per author: entries that wait for a key
+	dirs       map[string]*directory // per member: the read-only copy of its directory
+	owner      ed25519.PublicKey     // the key of the conversation's owner: ours, or the one that invited us
+	lastView   directoryView         // what the window was told last
+	pinned     map[string]uint64     // per author: entries below this index came from the pin
+	locked     map[string]int        // per author: entries that wait for a key
 	pin        pinState
 	active     bool                              // in a conversation: it has its key and its pin
 	joining    *joinAttempt                      // the Join that waits for its inviter
@@ -153,11 +166,12 @@ func (c *ChatService) start() (err error) {
 		return err
 	}
 	c.store = kolostore.New(backend)
-	if c.log, err = openOwnLog(c.store, c.id); err != nil {
+	if err = c.openOwnLogs(); err != nil {
 		return err
 	}
 	c.peers = map[string]*koloswarm.Peer{}
 	c.replicas = map[string]*kolostore.Replica{}
+	c.dirs = map[string]*directory{}
 	c.pinned = map[string]uint64{}
 	c.locked = map[string]int{}
 	if c.members, err = loadMembers(c.set.DataDir); err != nil {
@@ -193,17 +207,21 @@ func (c *ChatService) enter(conv conversation) (err error) {
 	if c.aead, err = chacha20poly1305.NewX(c.set.conversationKey[:]); err != nil {
 		return err
 	}
-	if c.token, err = capability(c.set, c.id, c.log.ID()); err != nil {
+	if c.token, err = capability(c.set, c.id, c.log.ID(), c.dirLog.ID()); err != nil {
 		return err
 	}
 	c.srv = kolosync.NewServer(c.authorize)
-	if err = c.srv.Offer(c.log); err != nil {
-		return err
+	for _, l := range []*kolostore.Log{c.log, c.dirLog} {
+		if err = c.srv.Offer(l); err != nil {
+			return err
+		}
 	}
 	c.pinDone = make(chan struct{})
 	c.mu.Lock()
+	c.owner = ed25519.PublicKey(conv.Owner)
 	c.active = true // what the goroutines below read was written before this
 	c.mu.Unlock()
+	c.openDirectories()
 
 	c.wg.Go(c.pushLoop)
 	c.wg.Go(func() { // on open: the pin first, then the peers
@@ -241,6 +259,7 @@ func (c *ChatService) shutdown() error {
 		errs = append(errs, c.inv.Close())
 	}
 	c.wg.Wait()
+	c.closeDirectories()
 	if c.store != nil {
 		errs = append(errs, c.store.Close()) // also closes the log and the replicas
 	}
@@ -251,6 +270,7 @@ func (c *ChatService) shutdown() error {
 	c.active, c.joining, c.cancelJoin = false, nil, nil
 	c.mu.Unlock()
 	c.id, c.store, c.sw, c.cancel, c.inv, c.invDB = nil, nil, nil, nil, nil, nil
+	c.log, c.dirLog, c.dir = nil, nil, nil
 	return errors.Join(errs...)
 }
 
@@ -340,6 +360,8 @@ func (c *ChatService) receive(p *koloswarm.Peer) {
 			c.onHello(p, m)
 		case "msg":
 			c.onMessage(p, m)
+		case "dir":
+			c.onDirectory(p)
 		}
 	}
 }
@@ -363,9 +385,10 @@ func (c *ChatService) sendTo(p *koloswarm.Peer, m wireMsg) error {
 	return st.Close()
 }
 
-// Send seals the text with the conversation key and appends it to our log. Then it hands it to every peer
-// that is connected, and to the pin for those who are not. A pin that fails never fails the Send.
-func (c *ChatService) Send(text string) error {
+// Send seals the text, with the room it is for, with the conversation key and appends it to our log. Then it
+// hands it to every peer that is connected, and to the pin for those who are not. A pin that fails never fails
+// the Send. The room must be one of Rooms, or Send returns ErrUnknownRoom.
+func (c *ChatService) Send(room, text string) error {
 	if len(text) > maxMessage {
 		return errors.New("message too long")
 	}
@@ -375,7 +398,10 @@ func (c *ChatService) Send(text string) error {
 	if !c.isActive() {
 		return ErrNotInConversation
 	}
-	sealed, err := c.seal(text)
+	if !slices.Contains(c.Rooms(), room) {
+		return ErrUnknownRoom
+	}
+	sealed, err := c.seal(room, text)
 	if err != nil {
 		return err
 	}
@@ -398,29 +424,54 @@ func (c *ChatService) Send(text string) error {
 	return nil
 }
 
-// seal and open protect the text with the conversation key (XChaCha20-Poly1305), bound to the author's key.
-// This is the layer the pin and anyone with entry keys cannot remove.
-func (c *ChatService) seal(text string) ([]byte, error) {
+// body is what a message holds before it is sealed: the room and the text. The room is inside the sealed bytes,
+// so the pin and anyone with entry keys but not the conversation key cannot tell which room a message is for.
+type body struct {
+	Version int    `json:"v"`
+	Room    string `json:"room"`
+	Text    string `json:"text"`
+}
+
+// seal and open protect the room and the text with the conversation key (XChaCha20-Poly1305), bound to the
+// author's key. This is the layer the pin and anyone with entry keys cannot remove. open takes an entry that
+// is not a body, such as one written by step 4, for text in the default room.
+func (c *ChatService) seal(room, text string) ([]byte, error) {
+	plain, err := json.Marshal(body{Version: 1, Room: room, Text: text})
+	if err != nil {
+		return nil, err
+	}
 	nonce := make([]byte, c.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	return c.aead.Seal(nonce, nonce, []byte(text), c.pub), nil
+	return c.aead.Seal(nonce, nonce, plain, c.pub), nil
 }
 
-func (c *ChatService) open(author ed25519.PublicKey, sealed []byte) (string, error) {
+func (c *ChatService) open(author ed25519.PublicKey, sealed []byte) (room, text string, err error) {
 	n := c.aead.NonceSize()
 	if len(sealed) < n {
-		return "", errors.New("sealed text too short")
+		return "", "", errors.New("sealed text too short")
 	}
-	text, err := c.aead.Open(nil, sealed[:n], sealed[n:], author)
-	return string(text), err
+	plain, err := c.aead.Open(nil, sealed[:n], sealed[n:], author)
+	if err != nil {
+		return "", "", err
+	}
+	var b body
+	if json.Unmarshal(plain, &b) != nil || b.Version != 1 {
+		return defaultRoom, string(plain), nil
+	}
+	if validRoomName(b.Room) != nil {
+		return "", "", errors.New("message for a room with a bad name")
+	}
+	return b.Room, b.Text, nil
 }
 
 // hello introduces us: our signed log header, which names our key and log ID, and a proof that we know the
-// conversation key, bound to both keys so it cannot be replayed to another peer.
+// conversation key, bound to both keys so it cannot be replayed to another peer. The directory header is how a
+// peer learns which log holds our profile.
 func (c *ChatService) hello(p *koloswarm.Peer, reply bool) wireMsg {
-	return wireMsg{Kind: "hello", Header: c.log.Header().Encode(), Proof: c.proof(c.pub, p.PublicKey()), Reply: reply}
+	return wireMsg{Kind: "hello", Header: c.log.Header().Encode(), DirHeader: c.dirLog.Header().Encode(),
+		Proof: c.proof(c.pub, p.PublicKey()), Reply: reply}
 }
 
 func (c *ChatService) proof(from, to ed25519.PublicKey) []byte {
@@ -441,7 +492,11 @@ func (c *ChatService) onHello(p *koloswarm.Peer, m wireMsg) {
 		log.Print("hello refused from ", hex.EncodeToString(pub)[:8])
 		return
 	}
-	if err := c.addMember(pub, m.Header); err != nil {
+	if err := checkDirHeader(pub, m.DirHeader, h); err != nil {
+		log.Print("hello refused from ", hex.EncodeToString(pub)[:8], ": ", err)
+		return
+	}
+	if err := c.addMember(pub, m.Header, m.DirHeader); err != nil {
 		log.Print("member: ", err)
 		return
 	}
@@ -454,12 +509,12 @@ func (c *ChatService) onHello(p *koloswarm.Peer, m wireMsg) {
 	c.wg.Go(func() { c.syncFromPeer(p) })
 }
 
-// authorize lets the members of the conversation read our log with its entry keys, and nobody else.
+// authorize lets the members of the conversation read our two logs with their entry keys, and nobody else.
 func (c *ChatService) authorize(peer, owner ed25519.PublicKey, logID kololog.LogID) kolosync.Access {
 	c.mu.Lock()
 	_, ok := c.members[hex.EncodeToString(peer)]
 	c.mu.Unlock()
-	if ok && owner.Equal(c.pub) && logID == c.log.ID() {
+	if ok && owner.Equal(c.pub) && (logID == c.log.ID() || logID == c.dirLog.ID()) {
 		return kolosync.Keys
 	}
 	return kolosync.NoAccess
@@ -477,25 +532,20 @@ func (c *ChatService) onMessage(p *koloswarm.Peer, m wireMsg) {
 	case m.Index > next:
 		c.wg.Go(func() { c.syncFromPeer(p) })
 	case m.Index == next:
-		text, err := c.open(p.PublicKey(), m.Sealed)
+		room, text, err := c.open(p.PublicKey(), m.Sealed)
 		if err != nil {
 			log.Print("direct message refused: ", err)
 			return
 		}
 		c.setShown(author, next+1)
-		c.emit("chat:msg", ChatMsg{From: author, Text: text, Via: "direct"})
+		c.emit("chat:msg", ChatMsg{From: author, Room: room, Text: text, Via: "direct"})
 	}
 }
 
-// syncFromPeer pulls the sender's log from the sender, with its entry keys, and shows what is new. It waits
-// for the pull from the pin at start, so what the pin has is taken from the pin.
+// syncFromPeer pulls the sender's log and its directory from the sender, with their entry keys, and shows what
+// is new. It waits for the pull from the pin at start, so what the pin has is taken from the pin.
 func (c *ChatService) syncFromPeer(p *koloswarm.Peer) {
-	select {
-	case <-c.pinDone:
-	case <-c.ctx.Done():
-		return
-	}
-	conn, ok := p.Conn().(*kolosecure.Conn)
+	conn, ok := c.afterPin(p)
 	if !ok {
 		return
 	}
@@ -503,18 +553,30 @@ func (c *ChatService) syncFromPeer(p *koloswarm.Peer) {
 	rep, err := c.replica(author)
 	if err != nil {
 		log.Print("replica: ", err)
-		return
+	} else {
+		ctx, cancel := context.WithTimeout(c.ctx, pinTimeout)
+		c.pullMu.Lock()
+		err = kolosync.Pull(ctx, conn, rep)
+		c.pullMu.Unlock()
+		cancel()
+		if err != nil && c.ctx.Err() == nil {
+			log.Print("sync from peer: ", err)
+		} else {
+			c.show(author)
+		}
 	}
-	ctx, cancel := context.WithTimeout(c.ctx, pinTimeout)
-	defer cancel()
-	c.pullMu.Lock()
-	err = kolosync.Pull(ctx, conn, rep)
-	c.pullMu.Unlock()
-	if err != nil && c.ctx.Err() == nil {
-		log.Print("sync from peer: ", err)
-		return
+	c.syncDirectory(conn, author)
+}
+
+// afterPin waits for the pull from the pin at start, and returns the peer's connection if it can be synced.
+func (c *ChatService) afterPin(p *koloswarm.Peer) (*kolosecure.Conn, bool) {
+	select {
+	case <-c.pinDone:
+	case <-c.ctx.Done():
+		return nil, false
 	}
-	c.show(author)
+	conn, ok := p.Conn().(*kolosecure.Conn)
+	return conn, ok
 }
 
 // show gives the window the messages of an author that it has not seen, in the order of the author's log. It
@@ -538,15 +600,15 @@ func (c *ChatService) show(author string) {
 			break
 		}
 		if err == nil {
-			var text string
-			if text, err = c.open(pub, sealed); err == nil {
+			var room, text string
+			if room, text, err = c.open(pub, sealed); err == nil {
 				c.mu.Lock()
 				via := "peer"
 				if index < c.pinned[author] {
 					via = "pin"
 				}
 				c.mu.Unlock()
-				c.emit("chat:msg", ChatMsg{From: author, Text: text, Via: via})
+				c.emit("chat:msg", ChatMsg{From: author, Room: room, Text: text, Via: via})
 			}
 		}
 		if err != nil && !errors.Is(err, kololog.ErrDeleted) {
@@ -619,24 +681,6 @@ func loadIdentity(dir string) (*koloid.Identity, error) {
 	return id, nil
 }
 
-// openOwnLog opens our log in the store, or creates it the first time.
-func openOwnLog(st *kolostore.Store, id *koloid.Identity) (*kolostore.Log, error) {
-	ids, err := st.List()
-	if err != nil {
-		return nil, err
-	}
-	for _, logID := range ids {
-		pub, replica, err := st.Owner(logID)
-		if err != nil {
-			return nil, err
-		}
-		if !replica && pub.Equal(id.PublicKey()) {
-			return st.Open(id, logID)
-		}
-	}
-	return st.Create(id)
-}
-
 // replica opens, once, the read-only copy of a member's log that we keep in our store.
 func (c *ChatService) replica(author string) (*kolostore.Replica, error) {
 	c.mu.Lock()
@@ -698,15 +742,27 @@ func (c *ChatService) setShown(author string, n uint64) {
 	}
 }
 
-func (c *ChatService) addMember(pub ed25519.PublicKey, header []byte) error {
+// addMember registers a member from its signed headers. A member we know gets its directory header when it
+// first sends one. The owner also writes every new member in the member list.
+func (c *ChatService) addMember(pub ed25519.PublicKey, header, dirHeader []byte) error {
 	author := hex.EncodeToString(pub)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.members[author]; ok {
+	m, known := c.members[author]
+	switch {
+	case !known:
+		c.members[author] = &member{Header: header, DirHeader: dirHeader}
+	case len(m.DirHeader) == 0 && len(dirHeader) > 0:
+		m.DirHeader = dirHeader
+	default:
+		c.mu.Unlock()
 		return nil
 	}
-	c.members[author] = &member{Header: header}
-	return saveMembers(c.set.DataDir, c.members)
+	err := saveMembers(c.set.DataDir, c.members)
+	c.mu.Unlock()
+	if err == nil && !known && c.recordMember(author) {
+		c.directoryChanged()
+	}
+	return err
 }
 
 func loadMembers(dir string) (map[string]*member, error) {

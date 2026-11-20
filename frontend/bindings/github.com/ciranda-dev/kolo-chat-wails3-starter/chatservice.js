@@ -11,6 +11,16 @@ import { Call as $Call, CancellablePromise as $CancellablePromise, Create as $Cr
 import * as $models from "./models.js";
 
 /**
+ * AddRoom adds a room to the room list, which only the owner writes: anyone else gets ErrNotOwner. A bad name
+ * is ErrInvalidRoom, and a room that exists (in any case) is ErrRoomExists.
+ * @param {string} name
+ * @returns {$CancellablePromise<void>}
+ */
+export function AddRoom(name) {
+    return $Call.ByID(3954234861, name);
+}
+
+/**
  * Approve lets in the person behind a request, giving it the conversation through the invite. Deny refuses it.
  * @param {number} request
  * @returns {$CancellablePromise<void>}
@@ -58,6 +68,14 @@ export function Invites() {
 }
 
 /**
+ * IsOwner says whether we are the owner: the only one that writes the room list and the member list.
+ * @returns {$CancellablePromise<boolean>}
+ */
+export function IsOwner() {
+    return $Call.ByID(3565431346);
+}
+
+/**
  * Join uses an invite code: it finds the inviter on the invite's topic, asks to join, and waits for the answer,
  * which for an invite that needs approval is a person's. With the answer it takes the conversation key and the
  * pin from the payload of the accept, keeps them in the data directory, and joins the conversation like an owner
@@ -80,6 +98,17 @@ export function Joined() {
 }
 
 /**
+ * Members lists the members we know: ourselves, the ones in the owner's member list, and the ones we met. Each
+ * has the profile that its own directory says, and the owner comes first.
+ * @returns {$CancellablePromise<$models.Member[]>}
+ */
+export function Members() {
+    return $Call.ByID(3040944214).then(/** @type {($result: any) => any} */(($result) => {
+        return $$createType3($result);
+    }));
+}
+
+/**
  * Revoke ends an invite: a joiner that uses its code from now on is refused, and the requests that wait for an
  * answer are refused too. Members that joined stay.
  * @param {string} id
@@ -90,13 +119,37 @@ export function Revoke(id) {
 }
 
 /**
- * Send seals the text with the conversation key and appends it to our log. Then it hands it to every peer
- * that is connected, and to the pin for those who are not. A pin that fails never fails the Send.
+ * Rooms lists the rooms of the conversation: the default room, then the ones the owner added, by name. They
+ * come from the owner's directory only, so what we have read of it is what we show.
+ * @returns {$CancellablePromise<string[]>}
+ */
+export function Rooms() {
+    return $Call.ByID(1314541413).then(/** @type {($result: any) => any} */(($result) => {
+        return $$createType4($result);
+    }));
+}
+
+/**
+ * Send seals the text, with the room it is for, with the conversation key and appends it to our log. Then it
+ * hands it to every peer that is connected, and to the pin for those who are not. A pin that fails never fails
+ * the Send. The room must be one of Rooms, or Send returns ErrUnknownRoom.
+ * @param {string} room
  * @param {string} text
  * @returns {$CancellablePromise<void>}
  */
-export function Send(text) {
-    return $Call.ByID(2164379061, text);
+export function Send(room, text) {
+    return $Call.ByID(2164379061, room, text);
+}
+
+/**
+ * SetProfile publishes our name and avatar in our directory. Every peer that is connected is told to pull it,
+ * and the pin gets it with the next push.
+ * @param {string} name
+ * @param {string} avatar
+ * @returns {$CancellablePromise<void>}
+ */
+export function SetProfile(name, avatar) {
+    return $Call.ByID(560698578, name, avatar);
 }
 
 /**
@@ -113,3 +166,6 @@ export function Start() {
 // Private type creation functions
 const $$createType0 = $models.InviteInfo.createFrom;
 const $$createType1 = $Create.Array($$createType0);
+const $$createType2 = $models.Member.createFrom;
+const $$createType3 = $Create.Array($$createType2);
+const $$createType4 = $Create.Array($Create.Any);
