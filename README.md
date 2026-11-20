@@ -29,7 +29,7 @@ scripts/stamp-version.sh v1.2.3 /path/to/a/copy   # then wails3 package in that 
 
 ## Tags
 
-The tags `step-2` to `step-8` hold the code of each step of the tutorial, to compare with your own files or to bring in the window of a step (`git checkout step-3 -- frontend`). They live on the `steps` branch, so `main` stays the starter.
+The tags `step-2` to `step-5` hold the code of each step of the tutorial, to compare with your own files or to bring in the window of a step (`git checkout step-3 -- frontend`). They live on the `steps` branch, so `main` stays the starter.
 
 ## License
 
