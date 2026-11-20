@@ -5,7 +5,7 @@ import logo from './assets/kolo-mark.svg'
 import './chat.css'
 import { appendMessage } from './messages.js'
 
-/** @typedef {{ id: number, from: string, text: string, mine: boolean }} Msg */
+/** @typedef {{ id: number, from: string, text: string, mine: boolean, via: string }} Msg */
 
 /** First 8 characters of a kolo-id, enough to tell peers apart. */
 const shortId = (id) => (id ? id.slice(0, 8) : '')
@@ -27,6 +27,7 @@ function App() {
   const [error, setError] = useState('')
   const [me, setMe] = useState('')
   const [peers, setPeers] = useState(0)
+  const [pin, setPin] = useState({ error: '', locked: 0 })
   const [failed, setFailed] = useState(false)
   const status = failed ? 'error' : peers > 0 ? 'live' : 'waiting'
   const bottomRef = useRef(null)
@@ -40,15 +41,18 @@ function App() {
         setError(errorText(err))
       })
     const offPeers = Events.On("chat:peers", (e) => setPeers(Number(e.data) || 0))
+    const offPin = Events.On("chat:pin", (e) => setPin({ error: e.data?.error ?? '', locked: e.data?.locked ?? 0 }))
     const off = Events.On("chat:msg", e => {
       const data = e.data
       const from = typeof data === 'object' && data ? (data.from ?? '') : ''
       const text = typeof data === 'object' && data ? (data.text ?? '') : String(data ?? '')
-      setMessages((prev) => appendMessage(prev, { id: nextId.current++, from, text, mine: false }))
+      const via = typeof data === 'object' && data ? (data.via ?? '') : ''
+      setMessages((prev) => appendMessage(prev, { id: nextId.current++, from, text, mine: false, via }))
     })
     return () => {
       off()
       offPeers()
+      offPin()
     }
   }, [])
 
@@ -64,7 +68,7 @@ function App() {
     Send(text)
       .then(() => {
         setError('')
-        setMessages((prev) => appendMessage(prev, { id: nextId.current++, from: me, text, mine: true }))
+        setMessages((prev) => appendMessage(prev, { id: nextId.current++, from: me, text, mine: true, via: '' }))
         setDraft('')
       })
       .catch((err) => {
@@ -102,6 +106,7 @@ function App() {
               <div className="msg">
                 <span className="msg__from" title={msg.from}>
                   {msg.mine ? 'you' : shortId(msg.from) || 'peer'}
+                  {msg.via === 'pin' ? <span className="msg__via"> · synced from pin</span> : null}
                 </span>
                 <div className="bubble">{msg.text}</div>
               </div>
@@ -112,6 +117,12 @@ function App() {
       </div>
 
       {error ? <p className="error">{error}</p> : null}
+      {pin.error ? <p className="error">{pin.error}</p> : null}
+      {!pin.error && pin.locked > 0 ? (
+        <p className="note">
+          {pin.locked} pinned {pin.locked === 1 ? 'message waits' : 'messages wait'} for the sender to come online.
+        </p>
+      ) : null}
 
       <form
         className="composer"

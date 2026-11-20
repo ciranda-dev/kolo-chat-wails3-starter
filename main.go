@@ -2,7 +2,10 @@ package main
 
 import (
 	"embed"
+	"errors"
+	"flag"
 	"log"
+	"os"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
@@ -16,12 +19,22 @@ var appIcon []byte
 func main() {
 	log.Printf("Kolo Chat %s", version)
 	applyMemoryLimit()
+	cfg, err := LoadConfig(os.Args[1:], os.Getenv, os.Stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+	// The chat tells the window what happens by emitting events; the Wails app is only needed once one is.
+	emit := func(name string, data any) { application.Get().Event.Emit(name, data) }
+
 	app := application.New(application.Options{
 		Name:        "Kolo Chat",
 		Description: "Peer-to-peer desktop chat built with Kolo",
 		Icon:        appIcon,
 		Services: []application.Service{
-			application.NewService(&ChatService{}),
+			application.NewService(NewChatService(cfg, emit)),
 		},
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),

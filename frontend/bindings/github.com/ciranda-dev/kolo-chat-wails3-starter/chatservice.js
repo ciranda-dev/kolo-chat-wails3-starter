@@ -7,6 +7,8 @@
 import { Call as $Call, CancellablePromise as $CancellablePromise, Create as $Create } from "@wailsio/runtime";
 
 /**
+ * Send seals the text with the conversation key and appends it to our log. Then it hands it to every peer
+ * that is connected, and to the pin for those who are not. A pin that fails never fails the Send.
  * @param {string} text
  * @returns {$CancellablePromise<void>}
  */
@@ -15,7 +17,10 @@ export function Send(text) {
 }
 
 /**
- * Start joins the network and returns this user's kolo-id (hex public key).
+ * Start joins the conversation and returns this user's kolo-id (hex public key). It opens the data directory,
+ * the log and the pin, so it fails with a *ConfigError for a bad setting and with the errors of kolo-pin
+ * (pin.ErrExpired, pin.ErrUnauthorized) for a bad token. A pin that cannot be reached is not an error: the chat
+ * works directly and tells the window.
  * @returns {$CancellablePromise<string>}
  */
 export function Start() {
