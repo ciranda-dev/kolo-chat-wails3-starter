@@ -27,10 +27,11 @@ export function AddRoom(conv, name) {
 /**
  * @param {string} conv
  * @param {number} request
+ * @param {boolean} admin
  * @returns {$CancellablePromise<void>}
  */
-export function Approve(conv, request) {
-    return $Call.ByID(543308489, conv, request);
+export function Approve(conv, request, admin) {
+    return $Call.ByID(543308489, conv, request, admin);
 }
 
 /**
@@ -86,13 +87,14 @@ export function Invites(conv) {
  * @param {string} conv
  * @returns {$CancellablePromise<boolean>}
  */
-export function IsOwner(conv) {
-    return $Call.ByID(1639896871, conv);
+export function IsAdmin(conv) {
+    return $Call.ByID(1495879111, conv);
 }
 
 /**
- * Join uses an invite code in the join that waits, or in a new folder: each invite is a conversation of its own,
- * with a new kolo-id. A Join that fails or is cancelled keeps that folder for the next one.
+ * Join uses an invite code in a new folder: each invite is a conversation of its own, with a new kolo-id. A Join
+ * that fails or is cancelled removes that folder, kolo-id included: an admin may have admitted that key already, and
+ * the braid admits a key once, so the next Join starts with a new one.
  * @param {string} code
  * @param {string} name
  * @returns {$CancellablePromise<$models.ConversationInfo>}
@@ -121,6 +123,15 @@ export function Members(conv) {
     return $Call.ByID(2906856171, conv).then(/** @type {($result: any) => any} */(($result) => {
         return $$createType5($result);
     }));
+}
+
+/**
+ * @param {string} conv
+ * @param {string} key
+ * @returns {$CancellablePromise<void>}
+ */
+export function RemoveMember(conv, key) {
+    return $Call.ByID(765812194, conv, key);
 }
 
 /**

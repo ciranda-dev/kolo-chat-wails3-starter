@@ -32,11 +32,8 @@ func newGroup(t *testing.T) group {
 	g.a, g.aev = start(t, g.n.config(dataDir(t)))
 	g.b, g.bev = start(t, g.n.joiner(g.bdir))
 	g.c, g.cev = start(t, g.n.joiner(g.cdir))
-	info := mustCreate(t, g.a, InviteOptions{TTLSeconds: 3600, Uses: 2})
 	for _, m := range []*ChatService{g.b, g.c} {
-		if err := m.Join(info.Code); err != nil {
-			t.Fatal(err)
-		}
+		joinVia(t, g.a, m, false)
 	}
 	linked(t, g.a, g.b)
 	linked(t, g.a, g.c)
@@ -94,14 +91,20 @@ func told(members []Member, who *ChatService) Member {
 }
 
 // The whole story with three instances joined by invite. Names and rooms reach everybody, also a member that
-// was closed (from the pin, as far as the pin can give it), and nobody writes what it does not own.
+// was closed (from the pin, as far as the pin can give it), and only an admin adds rooms.
 func TestProfilesAndRooms(t *testing.T) {
 	g := newGroup(t)
 	a, b, c := g.a, g.b, g.c
 
-	// Who is the owner is known from the start, to the owner and to the members the owner invited.
-	if !a.IsOwner() || b.IsOwner() || c.IsOwner() || !bytes.Equal(b.ownerKey(), a.pub) || !bytes.Equal(c.ownerKey(), a.pub) {
-		t.Fatal("A is the owner, and B and C know it")
+	// The founder is the admin and the settler, and B and C know it from the member list.
+	eventually(t, "the member lists", func() bool { return len(b.Members()) == 3 && len(c.Members()) == 3 })
+	if !a.IsAdmin() || b.IsAdmin() || c.IsAdmin() {
+		t.Fatal("A is the only admin")
+	}
+	for _, m := range []*ChatService{b, c} {
+		if first := m.Members()[0]; first.Key != keyOf(a) || !first.Admin || !first.Seat {
+			t.Fatalf("A comes first, as admin and settler: %+v", first)
+		}
 	}
 	for _, m := range []*ChatService{a, b, c} {
 		if !slices.Equal(m.Rooms(), []string{defaultRoom}) {
@@ -124,11 +127,9 @@ func TestProfilesAndRooms(t *testing.T) {
 		sees(t, viewer, c, "Cy")
 	}
 	members := b.Members()
-	if len(members) != 3 || !members[0].Owner || members[0].Key != keyOf(a) || members[0].Avatar != "octopus" {
-		t.Fatalf("the owner comes first, got %+v", members)
+	if len(members) != 3 || !members[0].Seat || members[0].Key != keyOf(a) || members[0].Avatar != "octopus" {
+		t.Fatalf("the settler comes first, got %+v", members)
 	}
-	// The owner's member list has all three, written by the owner when each joined.
-	eventually(t, "the member list", func() bool { return len(c.roster()) == 3 && len(a.roster()) == 3 })
 
 	// A change of name reaches the owner and C with an event, while everybody is online.
 	if err := b.SetProfile("Bob", "fox"); err != nil {
@@ -172,10 +173,10 @@ func TestProfilesAndRooms(t *testing.T) {
 	eventually(t, "the room events", func() bool {
 		return slices.Equal(g.bev.lastRooms(), []string{defaultRoom, "dev"}) && slices.Equal(g.cev.lastRooms(), []string{defaultRoom, "dev"})
 	})
-	if err := b.AddRoom("random"); !errors.Is(err, ErrNotOwner) {
+	if err := b.AddRoom("random"); !errors.Is(err, ErrNotAdmin) {
 		t.Fatalf("a member adds no room, got %v", err)
 	}
-	if err := c.AddRoom("random"); !errors.Is(err, ErrNotOwner) {
+	if err := c.AddRoom("random"); !errors.Is(err, ErrNotAdmin) {
 		t.Fatalf("got %v", err)
 	}
 	for name, want := range map[string]error{"DEV": ErrRoomExists, "general": ErrRoomExists, "": ErrInvalidRoom, "x\ty": ErrInvalidRoom, strings.Repeat("r", maxRoomName+1): ErrInvalidRoom} {
@@ -257,75 +258,59 @@ func TestProfilesAndRooms(t *testing.T) {
 	if err := theirs.db.Put([]byte(keyProfile), []byte("Mallory")); !errors.Is(err, kolokv.ErrReadOnly) {
 		t.Fatalf("got %v", err)
 	}
-	// B cannot write the owner's keys through the app either.
-	if _, err := b2.write(prefixRoom+"evil", stamp{}, false); !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("got %v", err)
-	}
-	// Writing them in its own directory by hand, past the app, achieves nothing: the log is B's, and a room or
-	// a member is read only from the owner's log. The profile in B's log is B's, whatever it says.
-	evil, _ := b2.sealValue(prefixRoom+"evil", stamp{At: 1})
-	fake, _ := b2.sealValue(prefixMember+strings.Repeat("ab", 32), stamp{At: 1})
+	// A profile B writes by hand, past the app, is B's profile and only B's.
 	forged, _ := b2.sealValue(keyProfile, Profile{Name: "Mallory"})
-	for key, value := range map[string][]byte{prefixRoom + "evil": evil, prefixMember + strings.Repeat("ab", 32): fake, keyProfile: forged} {
-		if err := b2.dir.Put([]byte(key), value); err != nil {
-			t.Fatal(err)
-		}
+	if err := b2.dir.Put([]byte(keyProfile), forged); err != nil {
+		t.Fatal(err)
 	}
 	b2.directoryChanged()
-	eventually(t, "A to hold the forged keys", func() bool {
-		db := a.readerOf(keyOf(b2))
-		_, err := db.Get([]byte(prefixRoom + "evil"))
-		return err == nil
-	})
-	eventually(t, "C to hold the forged keys", func() bool {
-		_, err := c2.readerOf(keyOf(b2)).Get([]byte(prefixRoom + "evil"))
-		return err == nil
-	})
-	for _, viewer := range []*ChatService{a, c2, b2} {
-		if !slices.Equal(viewer.Rooms(), []string{defaultRoom, "dev"}) {
-			t.Fatalf("a room written by B shows up: %v", viewer.Rooms())
-		}
-		if r := viewer.roster(); len(r) != 3 || slices.Contains(r, strings.Repeat("ab", 32)) {
-			t.Fatalf("a member written by B shows up: %v", r)
-		}
-	}
 	sees(t, a, b2, "Mallory") // what B writes in its own directory is B's profile, and only B's
 	if nameOn(a, c2) != "Cy" || nameOn(c2, c2) != "Cy" || nameOn(b2, c2) != "Cy" {
 		t.Fatal("C's profile is C's own")
 	}
-	if !a.IsOwner() || b2.IsOwner() {
-		t.Fatal("ownership does not move")
+	if !a.IsAdmin() || b2.IsAdmin() {
+		t.Fatal("roles do not move")
 	}
 	// A value cannot be moved to another key or another author.
 	if err := a.openValue(b.pub, keyProfile, sealed, &Profile{}); err != nil {
 		t.Fatalf("the value opens where it was written: %v", err)
 	}
-	if a.openValue(b.pub, prefixRoom+"x", sealed, &stamp{}) == nil || a.openValue(c.pub, keyProfile, sealed, &Profile{}) == nil {
+	if a.openValue(b.pub, "other", sealed, &Profile{}) == nil || a.openValue(c.pub, keyProfile, sealed, &Profile{}) == nil {
 		t.Fatal("a value must not open under another key or author")
 	}
 }
 
-// A member that is invited by another member knows the real owner, and the owner writes the new member in its
-// list when they meet.
-func TestInvitedByAMember(t *testing.T) {
+// Only an admin invites. A member approved as an admin invites, approves and adds rooms; one approved as a member
+// gets ErrNotAdmin for each.
+func TestInvitedByAnAdmin(t *testing.T) {
 	g := newGroup(t)
-	info := mustCreate(t, g.b, InviteOptions{TTLSeconds: 3600})
+	if _, err := g.b.CreateInvite(InviteOptions{}); !errors.Is(err, ErrNotAdmin) {
+		t.Fatalf("a member invites, got %v", err)
+	}
+	if err := g.b.Approve(1, false); !errors.Is(err, ErrNotAdmin) {
+		t.Fatalf("a member approves, got %v", err)
+	}
+	if err := g.b.Deny(1); !errors.Is(err, ErrNotAdmin) {
+		t.Fatalf("a member denies, got %v", err)
+	}
 	d, _ := start(t, g.n.joiner(dataDir(t)))
-	if err := d.Join(info.Code); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(d.ownerKey(), g.a.pub) || d.IsOwner() {
-		t.Fatal("D takes the owner from the member that invited it, who names the owner")
-	}
-	linked(t, g.a, d)
-	eventually(t, "the owner to list D", func() bool { return slices.Contains(g.a.roster(), keyOf(d)) })
-	if err := d.AddRoom("x"); !errors.Is(err, ErrNotOwner) {
+	joinVia(t, g.a, d, true)
+	eventually(t, "D to be an admin", d.IsAdmin)
+	e, _ := start(t, g.n.joiner(dataDir(t)))
+	joinVia(t, d, e, false)
+	linked(t, g.a, e)
+	eventually(t, "the founder to list E", func() bool { return g.a.isAccepted(keyOf(e)) })
+	if err := e.AddRoom("x"); !errors.Is(err, ErrNotAdmin) {
 		t.Fatalf("got %v", err)
 	}
-	if err := d.SetProfile("Dee", "d"); err != nil {
+	if err := d.AddRoom("x"); err != nil {
 		t.Fatal(err)
 	}
-	sees(t, g.a, d, "Dee")
+	seesRooms(t, g.a, defaultRoom, "x")
+	if err := e.SetProfile("Dee", "d"); err != nil {
+		t.Fatal(err)
+	}
+	sees(t, g.a, e, "Dee")
 }
 
 // The directory is in the data directory: a restart opens the same log, with the profile in it, and a store
@@ -351,7 +336,7 @@ func TestDirectorySurvivesARestart(t *testing.T) {
 	if a2.dirLog.ID() != id || nameOn(a2, a2) != "Ana" || !slices.Equal(a2.Rooms(), []string{defaultRoom, "dev"}) {
 		t.Fatalf("the directory should be the same: %v, %q, %v", a2.dirLog.ID() == id, nameOn(a2, a2), a2.Rooms())
 	}
-	if m := a2.Members(); len(m) != 1 || !m[0].Owner {
+	if m := a2.Members(); len(m) != 1 || !m[0].Seat {
 		t.Fatalf("got %+v", m)
 	}
 	a2.ServiceShutdown()

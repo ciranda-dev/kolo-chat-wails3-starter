@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -187,7 +188,7 @@ func TestOldDataFolderIsRefused(t *testing.T) {
 
 // T2: a layout.json of another version, or a damaged one, is refused with its layout and nothing changes.
 func TestOtherLayoutIsRefused(t *testing.T) {
-	for body, want := range map[string]int{`{"layout":3}`: 3, `{"layout":`: -1, `{}`: -1, `{"layout":1}`: -1} {
+	for body, want := range map[string]int{`{"layout":4}`: 4, `{"layout":`: -1, `{}`: -1, `{"layout":1}`: -1} {
 		root := dataDir(t)
 		if err := os.WriteFile(filepath.Join(root, layoutFile), []byte(body), 0o600); err != nil {
 			t.Fatal(err)
@@ -259,7 +260,7 @@ func TestNewDataFolderGetsTheLayout(t *testing.T) {
 		t.Fatalf("without conversations/: %v", err)
 	}
 	a.ServiceShutdown()
-	if b, err := os.ReadFile(filepath.Join(root, layoutFile)); err != nil || string(b) != `{"layout":2}` {
+	if b, err := os.ReadFile(filepath.Join(root, layoutFile)); err != nil || string(b) != `{"layout":3}` {
 		t.Fatalf("layout.json: %q, %v", b, err)
 	}
 	for path, mode := range map[string]os.FileMode{layoutFile: 0o600, conversationDir: os.ModeDir | 0o700} {
@@ -291,11 +292,7 @@ func TestConversationsStayApart(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		info, err := bob.Join(inv.Code, name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return info
+		return joinConv(t, engineOf(t, alice, conv), bob, inv.Code, name)
 	}
 	bfam := join(fam.ID, "Family")
 	began := time.Now()
@@ -360,7 +357,7 @@ func TestConversationKeySetting(t *testing.T) {
 
 	first, _ := startApp(t, cfg)
 	list := first.List()
-	if len(list) != 1 || !list[0].Joined || !list[0].Owner || list[0].Name != defaultConvName || keyOf(list[0].ID) != testKey {
+	if len(list) != 1 || !list[0].Joined || !list[0].Admin || list[0].Name != defaultConvName || keyOf(list[0].ID) != testKey {
 		t.Fatalf("first start: %+v", list)
 	}
 	id := list[0].ID
@@ -408,7 +405,11 @@ func TestFixedListenPortHoldsOneConversation(t *testing.T) {
 	}
 	a.ServiceShutdown()
 
-	if err := os.Mkdir(filepath.Join(cfg.DataDir, conversationDir, strings.Repeat("ab", 16)), 0o700); err != nil {
+	second := filepath.Join(cfg.DataDir, conversationDir, strings.Repeat("ab", 16))
+	if err := os.Mkdir(second, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(second, "conversation.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := NewConversations(cfg, (&convEvents{}).emit).Start(); !isListenError(err) {
@@ -432,7 +433,7 @@ func TestCreateConversation(t *testing.T) {
 	root := dataDir(t)
 	a, ev := startApp(t, n.app(root))
 	x, y := mustCreateConv(t, a, "Family"), mustCreateConv(t, a, "  ")
-	if !x.Owner || !x.Joined || x.Name != "Family" || y.Name != defaultConvName || x.Error != "" {
+	if !x.Admin || !x.Joined || x.Name != "Family" || y.Name != defaultConvName || x.Error != "" {
 		t.Fatalf("created: %+v %+v", x, y)
 	}
 	keys := map[string]bool{}
@@ -480,35 +481,200 @@ func TestCreateConversation(t *testing.T) {
 	}
 }
 
-// A Join that fails keeps its one folder, the join that waits, and the next Join takes it again; after a restart it
-// is still the join that waits, not a conversation. It counts toward the bound.
-func TestJoinKeepsOnePendingFolder(t *testing.T) {
+// S18: a Join that fails, or is cancelled, removes its folder, kolo-id included, and the next Join starts in a new
+// folder with a new kolo-id: an admin may have admitted the old key already. A restart removes a join a crash stopped.
+// The bound counts the join in progress.
+func TestFailedJoinStartsAfresh(t *testing.T) {
 	n := newNetwork(t)
+	owner, _ := startApp(t, n.app(dataDir(t)))
+	code, err := owner.CreateInvite(mustCreateConv(t, owner, "Family").ID, InviteOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.ServiceShutdown() // nobody answers, so the join waits
+
 	root := dataDir(t)
 	a, _ := startApp(t, n.app(root))
-	for _, code := range []string{"not a code", "still not a code"} {
-		var ie *InviteError
-		if _, err := a.Join(code, ""); !errors.As(err, &ie) || !errors.Is(err, invite.ErrInvalidCode) {
-			t.Fatalf("%q: %v", code, err)
-		}
+	var ie *InviteError
+	if _, err := a.Join("not a code", ""); !errors.As(err, &ie) || !errors.Is(err, invite.ErrInvalidCode) {
+		t.Fatalf("a bad code: %v", err)
 	}
-	first := folders(t, root)
-	if l := a.List(); len(first) != 1 || len(l) != 1 || l[0].Joined || l[0].ID != first[0] {
-		t.Fatalf("folders %v, list %+v", first, l)
+	if got := folders(t, root); len(got) != 0 || len(a.List()) != 0 {
+		t.Fatalf("a failed join left %v", got)
 	}
 	for range maxConversations - 1 {
 		mustCreateConv(t, a, "")
 	}
+	done := make(chan error, 1)
+	go func() { _, err := a.Join(code.Code, "Family"); done <- err }()
+	eventually(t, "the join to start", func() bool { return len(folders(t, root)) == maxConversations })
 	if _, err := a.Create("One more"); !errors.Is(err, ErrTooManyConversations) {
-		t.Fatalf("past the bound: %v", err)
+		t.Fatalf("the join in progress does not count: %v", err)
+	}
+	i := slices.IndexFunc(a.List(), func(c ConversationInfo) bool { return !c.Joined })
+	if i < 0 {
+		t.Fatalf("the join in progress is not listed as one: %+v", a.List())
+	}
+	c := engineOf(t, a, a.List()[i].ID)
+	eventually(t, "the join to wait", func() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.joining != nil })
+	a.CancelJoin()
+	if err := waitJoin(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled join: %v", err)
+	}
+	if got := folders(t, root); len(got) != maxConversations-1 {
+		t.Fatalf("a cancelled join left %v", got)
 	}
 	a.ServiceShutdown()
 
+	stale := filepath.Join(root, conversationDir, strings.Repeat("ef", 16)) // a join a crash stopped
+	if err := os.Mkdir(stale, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	b, _ := startApp(t, n.app(root))
-	l := b.List()
-	if i := slices.IndexFunc(l, func(c ConversationInfo) bool { return c.ID == first[0] }); len(l) != maxConversations || i < 0 || l[i].Joined || l[i].Error != "" {
+	if l := b.List(); len(l) != maxConversations-1 || exists(t, stale) {
 		t.Fatalf("after a restart: %+v", l)
 	}
+}
+
+// A member's folder that lost conversation.json is not a join that did not finish: a start refuses it with the folder
+// to move aside and deletes nothing, whether the member wrote or not.
+func TestMemberFolderWithoutConversationIsKept(t *testing.T) {
+	n := newNetwork(t)
+	alice, _ := startApp(t, n.app(dataDir(t)))
+	conv := mustCreateConv(t, alice, "Kept")
+	af := engineOf(t, alice, conv.ID)
+	for _, writes := range []bool{true, false} {
+		inv, err := alice.CreateInvite(conv.ID, InviteOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := n.joiner(dataDir(t))
+		app, _ := startApp(t, cfg)
+		info := joinConv(t, af, app, inv.Code, "Kept")
+		if writes {
+			if err := app.Send(info.ID, defaultRoom, "a message to keep"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		app.ServiceShutdown()
+		dir := filepath.Join(cfg.DataDir, conversationDir, info.ID)
+		if err := os.Remove(filepath.Join(dir, "conversation.json")); err != nil {
+			t.Fatal(err)
+		}
+		again, _ := startApp(t, cfg)
+		l := again.List()
+		if len(l) != 1 || l[0].ID != info.ID || l[0].Folder != dir || !strings.Contains(l[0].Error, "conversation.json is gone") {
+			t.Fatalf("writes %v, the row: %+v", writes, l)
+		}
+		for _, name := range []string{"identity.key", "store", "braid", "members.json", localFile} {
+			if !exists(t, filepath.Join(dir, name)) {
+				t.Fatalf("%s/%s was deleted", dir, name)
+			}
+		}
+	}
+}
+
+// A conversation.json that is a FIFO, a dangling link or a file nobody may read never hangs a start: the row says why,
+// and the folder and the file stay.
+func TestSpecialConversationFileKeepsTheFolder(t *testing.T) {
+	n := newNetwork(t)
+	root := dataDir(t)
+	a, _ := startApp(t, n.app(root))
+	a.ServiceShutdown()
+	kinds := map[string]func(string) error{
+		"fifo":     mkfifo,
+		"dangling": func(p string) error { return os.Symlink(filepath.Join(filepath.Dir(p), "nowhere"), p) },
+		"mode 000": func(p string) error { return os.WriteFile(p, []byte("{}"), 0) },
+	}
+	made := map[string]string{}
+	for kind, create := range kinds {
+		dir := filepath.Join(root, conversationDir, fmt.Sprintf("%032x", len(made)+1))
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := create(filepath.Join(dir, "conversation.json")); err != nil {
+			t.Logf("%s: %v", kind, err) // no FIFO on this system
+			os.RemoveAll(dir)
+			continue
+		}
+		made[kind] = dir
+	}
+	// S7-11: a folder with members.json and no conversation.json is no join that did not finish.
+	members := filepath.Join(root, conversationDir, fmt.Sprintf("%032x", 9))
+	if err := os.Mkdir(members, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(members, "members.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := NewConversations(n.app(root), (&convEvents{}).emit)
+	started := make(chan error, 1)
+	go func() { _, err := b.Start(); started <- err }()
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { b.ServiceShutdown() }) // only once the start returned: a hung one holds its lock
+	case <-time.After(30 * time.Second):
+		t.Fatal("the start hangs on a special conversation.json")
+	}
+	if !exists(t, filepath.Join(members, "members.json")) {
+		t.Fatal("a folder with members.json was deleted")
+	}
+	var rows []ConversationInfo
+	for _, r := range b.List() {
+		if r.ID != filepath.Base(members) {
+			rows = append(rows, r)
+		}
+	}
+	if len(rows) != len(made) {
+		t.Fatalf("rows %+v", rows)
+	}
+	for _, r := range rows {
+		if !strings.Contains(r.Error, "conversation.json") || r.Folder == "" {
+			t.Errorf("a special conversation.json started: %+v", r)
+		}
+	}
+	for kind, dir := range made {
+		if _, err := os.Lstat(filepath.Join(dir, "conversation.json")); err != nil {
+			t.Errorf("%s: %v", kind, err)
+		}
+	}
+}
+
+// S8: a data folder of step 6, layout 2, is refused with its layout and the sentence to move it, and nothing in it
+// changes: its conversations have no braid, and there is no migration.
+func TestLayoutTwoIsRefused(t *testing.T) {
+	root := dataDir(t)
+	if err := writeJSON(filepath.Join(root, layoutFile), map[string]int{"layout": 2}); err != nil {
+		t.Fatal(err)
+	}
+	conv := filepath.Join(root, conversationDir, strings.Repeat("ab", 16))
+	if err := os.MkdirAll(conv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(conv, "conversation.json"), []byte(`{"key":"x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshot(t, root)
+	_, err := NewConversations(Config{DataDir: root}, (&convEvents{}).emit).Start()
+	var de *DataDirError
+	if !errors.As(err, &de) || de.Layout != 2 || de.Dir != root || !strings.Contains(err.Error(), "step 6") {
+		t.Fatalf("got %v", err)
+	}
+	if after := snapshot(t, root); !mapsEqual(after, before) {
+		t.Fatal("the folder changed")
+	}
+}
+
+func exists(t *testing.T, path string) bool {
+	t.Helper()
+	_, err := os.Lstat(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal(err)
+	}
+	return err == nil
 }
 
 // T16: every call with an unknown conversation ID fails with ErrUnknownConversation and reaches no conversation.
@@ -520,13 +686,13 @@ func TestUnknownConversation(t *testing.T) {
 	for _, conv := range []string{"", "nope", strings.Repeat("0", 32), "../" + known.ID, strings.ToUpper(known.ID)} {
 		_, members := a.Members(conv)
 		_, rooms := a.Rooms(conv)
-		_, owner := a.IsOwner(conv)
+		_, admin := a.IsAdmin(conv)
 		_, inv := a.CreateInvite(conv, InviteOptions{})
 		_, invs := a.Invites(conv)
 		for what, err := range map[string]error{
-			"Send": a.Send(conv, defaultRoom, "x"), "Members": members, "Rooms": rooms, "IsOwner": owner,
-			"SetProfile": a.SetProfile(conv, "Name", ""), "AddRoom": a.AddRoom(conv, "room"),
-			"CreateInvite": inv, "Invites": invs, "Revoke": a.Revoke(conv, "00"), "Approve": a.Approve(conv, 1),
+			"Send": a.Send(conv, defaultRoom, "x"), "Members": members, "Rooms": rooms, "IsAdmin": admin,
+			"RemoveMember": a.RemoveMember(conv, keyOf(c)), "SetProfile": a.SetProfile(conv, "Name", ""), "AddRoom": a.AddRoom(conv, "room"),
+			"CreateInvite": inv, "Invites": invs, "Revoke": a.Revoke(conv, "00"), "Approve": a.Approve(conv, 1, false),
 			"Deny": a.Deny(conv, 1),
 		} {
 			if !errors.Is(err, ErrUnknownConversation) {

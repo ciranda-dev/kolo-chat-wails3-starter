@@ -31,7 +31,7 @@ func capability(set settings, id *koloid.Identity, logs ...kololog.LogID) ([]byt
 		return set.token, checkToken(set.token, id, set.pinKey, logs...)
 	}
 	path := filepath.Join(set.DataDir, "pin-token")
-	if token, err := os.ReadFile(path); err == nil {
+	if token, err := readFile(path, maxStateFile); err == nil {
 		c, err := pin.ParseCapability(token)
 		if err == nil && c.Quota == set.PinQuota && time.Until(c.Expires) > set.PinTTL/2 &&
 			checkToken(token, id, set.pinKey, logs...) == nil {
@@ -111,7 +111,7 @@ func (c *ChatService) pushToPin(ctx context.Context) error {
 // pin sends ciphertext only, so an entry is stored but stays unreadable until its key arrives from the sender
 // (see syncFromPeer). A directory then shows what its entries with keys say, which is the older profile.
 func (c *ChatService) pullFromPin(ctx context.Context) error {
-	authors := c.authors()
+	authors := slices.DeleteFunc(c.authors(), func(a string) bool { return !c.isAccepted(a) }) // the roster only
 	if len(authors) == 0 {
 		return nil
 	}

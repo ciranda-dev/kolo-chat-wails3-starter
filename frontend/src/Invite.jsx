@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { Join, CancelJoin, CreateInvite, Invites, Revoke, Approve, Deny } from "../bindings/github.com/ciranda-dev/kolo-chat-wails3-starter/conversations.js"
 import { Events } from "@wailsio/runtime"
 
-/** @typedef {{ id: string, code?: string, expires: string, uses: number, used: number, requireApproval: boolean, state: string }} InviteInfo */
+/** @typedef {{ id: string, code?: string, expires: string, uses: number, used: number, state: string }} InviteInfo */
 /** @typedef {{ request: number, invite: string, joiner: string, withdrawn: boolean }} JoinRequest */
 
 const shortId = (id) => (id ? id.slice(0, 8) : '')
@@ -57,7 +57,7 @@ export function JoinPanel({ empty = false, onJoined }) {
     <form className="panel panel--center" onSubmit={join}>
       <h2 className="panel__title">Join with an invite</h2>
       {empty ? <p className="note">No conversation yet. Start one, or paste an invite.</p> : null}
-      <p className="note">Paste the invite code you received. If the owner wants to approve you, this waits for the answer.</p>
+      <p className="note">Paste the invite code you received. An admin of the conversation approves your request: this waits for the answer.</p>
       <input
         className="field"
         aria-label="Invite code"
@@ -88,11 +88,10 @@ export function JoinPanel({ empty = false, onJoined }) {
   )
 }
 
-/** Create an invite (expiry, uses, approval) for the conversation conv, and see or revoke the ones made so far. */
+/** Create an invite (expiry, uses) for the conversation conv, and see or revoke the ones made so far. An admin approves each request. */
 export function InvitePanel({ conv }) {
   const [seconds, setSeconds] = useState(86400)
   const [uses, setUses] = useState(1)
-  const [approval, setApproval] = useState(true)
   const [invites, setInvites] = useState(/** @type {InviteInfo[]} */ ([]))
   const [codes, setCodes] = useState(/** @type {Record<string, string>} */ ({}))
   const [error, setError] = useState('')
@@ -110,7 +109,7 @@ export function InvitePanel({ conv }) {
   const create = (ev) => {
     ev.preventDefault()
     setError('')
-    CreateInvite(conv, { ttlSeconds: seconds, uses: Number(uses) || 1, requireApproval: approval })
+    CreateInvite(conv, { ttlSeconds: seconds, uses: Number(uses) || 1 })
       .then((info) => {
         setCodes((prev) => ({ ...prev, [info.id]: info.code }))
         setInvites((prev) => [...prev, info])
@@ -145,19 +144,15 @@ export function InvitePanel({ conv }) {
             onChange={(ev) => setUses(ev.target.value)}
           />
         </label>
-        <label className="check">
-          <input type="checkbox" checked={approval} onChange={(ev) => setApproval(ev.target.checked)} />
-          Require my approval
-        </label>
         <button type="submit" className="btn">Create invite</button>
       </form>
+      <p className="note">An admin approves each request, as a member or as an admin. An admin can invite, approve, remove members and add rooms; the role does not change later.</p>
       {error ? <p className="error">{error}</p> : null}
       <ul className="invites">
         {invites.map((i) => (
           <li key={i.id} className="invite">
             <span className="invite__meta">
               {shortId(i.id)} · {i.state} · {i.used}/{i.uses} used
-              {i.requireApproval ? ' · needs approval' : ''}
               {i.expires ? ` · expires ${new Date(i.expires).toLocaleString()}` : ''}
             </span>
             {i.state === 'active' ? (
@@ -180,12 +175,12 @@ export function InvitePanel({ conv }) {
   )
 }
 
-/** The people waiting to be let in to the conversation conv, each with Approve and Deny. */
+/** The people waiting to be let in to the conversation conv, each approved as a member or as an admin, or denied. */
 export function Requests({ conv, requests, onDone }) {
   const [error, setError] = useState('')
   const answer = (call, request) => {
     setError('')
-    call(conv, request)
+    call(request)
       .then(() => onDone?.(request))
       .catch((err) => setError(errorText(err)))
   }
@@ -197,8 +192,9 @@ export function Requests({ conv, requests, onDone }) {
       {requests.map((r) => (
         <div key={r.request} className="request">
           <span className="request__who" title={r.joiner}>{shortId(r.joiner)} wants to join</span>
-          <button type="button" className="btn" onClick={() => answer(Approve, r.request)}>Approve</button>
-          <button type="button" className="btn btn--ghost" onClick={() => answer(Deny, r.request)}>Deny</button>
+          <button type="button" className="btn" onClick={() => answer((q) => Approve(conv, q, false), r.request)}>Approve as member</button>
+          <button type="button" className="btn btn--ghost" onClick={() => answer((q) => Approve(conv, q, true), r.request)}>Approve as admin</button>
+          <button type="button" className="btn btn--ghost" onClick={() => answer((q) => Deny(conv, q), r.request)}>Deny</button>
         </div>
       ))}
       {error ? <p className="error">{error}</p> : null}

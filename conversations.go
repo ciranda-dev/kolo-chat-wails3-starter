@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"os"
@@ -24,18 +25,21 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 )
 
 const (
-	layoutVersion    = 2
+	layoutVersion    = 3 // 3: each conversation has a braid
 	layoutFile       = "layout.json"
 	conversationDir  = "conversations"
 	localFile        = "local.json"
 	defaultConvName  = "Conversation"
 	maxConvName      = 32 // characters in a conversation's name, as in a room's
 	maxConversations = 8  // engines one app runs, each with its own socket, swarm and two stores
+	maxSmallFile     = 4096
+	maxStateFile     = 16 << 20 // conversation.json, members.json and a pin token: far above what the app writes
 )
 
 // oldLayoutNames are the files a data folder of step 5 or older held at its top, for its one conversation.
@@ -50,11 +54,13 @@ var (
 	ErrInvalidName          = errors.New("That name cannot be used")
 
 	errNotStarted = errors.New("not started")
+	errNotRegular = errors.New("not a regular file of a size this app writes")
 )
 
-// DataDirError is returned for a data folder this version cannot use, and nothing in it is changed. Layout 1 is a
-// folder of step 5 or older, which held one conversation; another Layout is one of another version (-1: its
-// layout.json is damaged), and Open one that other users can open. Dir is that folder.
+// DataDirError is returned for a folder this version cannot use, and nothing in it is changed. Layout 1 is a data
+// folder of step 5 or older, which held one conversation; Layout 2 one of step 6, whose conversations have no shared
+// member list; another Layout is one of another version (-1: its layout.json is damaged), and Open one that other
+// users can open. Without either, it is a conversation's folder that lost its conversation.json. Dir is that folder.
 type DataDirError struct {
 	Dir    string `json:"dir"`
 	Layout int    `json:"layout,omitempty"`
@@ -70,6 +76,13 @@ func (e *DataDirError) Error() string {
 		return "The data folder " + e.Dir + " holds one conversation of Kolo Chat step 5 or older, and this version keeps " +
 			"each conversation in a folder of its own. Quit Kolo Chat, move or rename that folder (nothing in it is " +
 			"deleted), then open Kolo Chat again: start a new conversation, or paste a new invite."
+	case e.Layout == 2:
+		return "The data folder " + e.Dir + " was made by Kolo Chat step 6, whose conversations have no shared member " +
+			"list. Quit Kolo Chat, move or rename that folder (nothing in it is deleted), then open Kolo Chat again: start " +
+			"a new conversation, or paste a new invite."
+	case e.Layout == 0:
+		return "The folder " + e.Dir + " holds a conversation whose conversation.json is gone. Quit Kolo Chat, move or " +
+			"rename that folder (nothing in it is deleted), then open Kolo Chat again and paste a new invite."
 	}
 	return fmt.Sprintf("The data folder %s was made by another version of Kolo Chat (layout %d). Use that version, "+
 		"or start with another -data. Nothing in the folder is changed.", e.Dir, e.Layout)
@@ -92,13 +105,13 @@ func openLayout(root string) error {
 	if err := privateDir(root); err != nil {
 		return err
 	}
-	data, err := os.ReadFile(filepath.Join(root, layoutFile))
+	data, err := readSmall(filepath.Join(root, layoutFile))
 	switch {
 	case err == nil:
 		var l struct {
 			Layout int `json:"layout"`
 		}
-		if json.Unmarshal(data, &l) != nil || l.Layout < layoutVersion {
+		if json.Unmarshal(data, &l) != nil || l.Layout < 2 { // no version wrote a layout below 2
 			return &DataDirError{Dir: root, Layout: -1}
 		}
 		if l.Layout != layoutVersion {
@@ -138,8 +151,58 @@ func privateDir(dir string) error {
 	return nil
 }
 
-// listConversations lists the conversation folders, oldest first. Of the folders without a conversation.json, the
-// joins that wait, only the first is used.
+// readSmall reads a regular file of at most maxSmallFile bytes.
+func readSmall(path string) ([]byte, error) { return readFile(path, maxSmallFile) }
+
+// readFile reads a regular file of at most limit bytes. The path is checked before the open, which does not wait as a
+// FIFO's would, and the opened file again, so a link, a device or a FIFO is never read and a start never hangs on one.
+func readFile(path string, limit int) ([]byte, error) {
+	if fi, err := os.Lstat(path); err != nil {
+		return nil, err
+	} else if !fi.Mode().IsRegular() {
+		return nil, errNotRegular
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return nil, errNotRegular
+	}
+	b, err := io.ReadAll(io.LimitReader(f, int64(limit)+1))
+	if err == nil && len(b) > limit {
+		err = errNotRegular
+	}
+	return b, err
+}
+
+// joinFiles are what a join that did not finish leaves in its folder.
+var joinFiles = []string{"identity.key", localFile, "store", "braid", "invites", "directory-log"}
+
+// onlyJoinFiles refuses a folder without conversation.json that holds anything a join that did not finish never makes,
+// such as members.json or a pin token, or a kolo-id without the two stores its join makes with it: such a kolo-id may
+// be on a member list. The engine then checks the stores.
+func onlyJoinFiles(dir string) error {
+	items, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	has := map[string]bool{}
+	for _, it := range items {
+		if !slices.Contains(joinFiles, it.Name()) {
+			return &DataDirError{Dir: dir}
+		}
+		has[it.Name()] = true
+	}
+	if has["identity.key"] && !(has["store"] && has["braid"]) {
+		return &DataDirError{Dir: dir}
+	}
+	return nil
+}
+
+// listConversations lists the conversation folders, oldest first. A folder without a conversation.json is a join that
+// did not finish, or a member's folder that lost the file, which its engine refuses.
 func listConversations(root string) ([]*convEntry, error) {
 	dir := filepath.Join(root, conversationDir)
 	items, err := os.ReadDir(dir)
@@ -159,16 +222,7 @@ func listConversations(root string) ([]*convEntry, error) {
 		all = append(all, e)
 	}
 	slices.SortFunc(all, compareEntries)
-	out, pending := all[:0], false
-	for _, e := range all {
-		if !e.joined && pending {
-			log.Printf("%s/%s: not a conversation, ignored", conversationDir, e.id)
-			continue
-		}
-		pending = pending || !e.joined
-		out = append(out, e)
-	}
-	return out, nil
+	return all, nil
 }
 
 func compareEntries(x, y *convEntry) int {
@@ -178,7 +232,7 @@ func compareEntries(x, y *convEntry) int {
 // loadLocal reads local.json. A damaged or missing one gives the name "Conversation", and the conversation opens.
 func loadLocal(dir string) localInfo {
 	var l localInfo
-	data, err := os.ReadFile(filepath.Join(dir, localFile))
+	data, err := readSmall(filepath.Join(dir, localFile))
 	if err == nil {
 		err = json.Unmarshal(data, &l)
 	}
@@ -228,7 +282,7 @@ type ConversationInfo struct {
 	Name   string `json:"name"`
 	Me     string `json:"me"`
 	Joined bool   `json:"joined"`
-	Owner  bool   `json:"owner"`
+	Admin  bool   `json:"admin"`
 	Error  string `json:"error"`
 	Folder string `json:"folder"`
 }
@@ -343,10 +397,23 @@ func (a *Conversations) Start() (AppInfo, error) {
 	a.mu.Unlock()
 	var wg sync.WaitGroup
 	for _, e := range entries {
+		if !e.joined {
+			if e.err = onlyJoinFiles(e.dir); e.err != nil { // left as it is, with its row
+				continue
+			}
+		}
 		wg.Go(func() { a.startEngine(e, a.engineConfig(e.dir, e == configured)) })
 	}
 	wg.Wait()
 	for _, e := range entries {
+		if !e.joined && e.chat != nil { // a join that did not finish: its engine found nothing of a member
+			log.Printf("%s/%s: a join that did not finish, removed", conversationDir, e.id)
+			if err := e.chat.ServiceShutdown(); err != nil {
+				log.Print("join: ", err)
+			}
+			a.dropFolder(e)
+			continue
+		}
 		a.add(e)
 	}
 	if isNew && configured.err != nil { // a bad setting, such as a -pin-token, as before there were several
@@ -433,8 +500,9 @@ func (a *Conversations) dropFolder(e *convEntry) {
 	}
 }
 
-// Join uses an invite code in the join that waits, or in a new folder: each invite is a conversation of its own,
-// with a new kolo-id. A Join that fails or is cancelled keeps that folder for the next one.
+// Join uses an invite code in a new folder: each invite is a conversation of its own, with a new kolo-id. A Join
+// that fails or is cancelled removes that folder, kolo-id included: an admin may have admitted that key already, and
+// the braid admits a key once, so the next Join starts with a new one.
 func (a *Conversations) Join(code, name string) (ConversationInfo, error) {
 	name, err := convName(name, defaultConvName)
 	if err != nil {
@@ -447,6 +515,9 @@ func (a *Conversations) Join(code, name string) (ConversationInfo, error) {
 		return ConversationInfo{}, err
 	}
 	if err := e.chat.Join(code); err != nil {
+		a.opMu.Lock()
+		a.discardJoin(e)
+		a.opMu.Unlock()
 		return ConversationInfo{}, err
 	}
 	a.opMu.Lock()
@@ -462,22 +533,18 @@ func (a *Conversations) Join(code, name string) (ConversationInfo, error) {
 	return a.infoOf(e), nil
 }
 
-// pendingJoin returns the conversation that waits for a join, made and started when there is none. One that did not
-// start is refused with its error: its folder has to be moved first.
+// pendingJoin returns the conversation of the join in progress, or a new one made and started for this join.
 func (a *Conversations) pendingJoin() (*convEntry, error) {
 	a.mu.Lock()
 	var pending *convEntry
 	for _, e := range a.convs {
-		if !e.joined {
+		if !e.joined && e.chat != nil {
 			pending = e
 		}
 	}
 	a.mu.Unlock()
-	switch {
-	case pending != nil && pending.chat == nil:
-		return nil, pending.err
-	case pending != nil:
-		return pending, nil
+	if pending != nil {
+		return pending, nil // its Join says that a join is in progress
 	}
 	if err := a.hasRoom(); err != nil {
 		return nil, err
@@ -493,6 +560,22 @@ func (a *Conversations) pendingJoin() (*convEntry, error) {
 	a.add(e)
 	a.emitList() // the window shows the kolo-id the join uses, for an invite that needs approval
 	return e, nil
+}
+
+// discardJoin stops the engine of a Join that failed and removes its folder, which never held a conversation.
+func (a *Conversations) discardJoin(e *convEntry) {
+	a.mu.Lock()
+	if a.convs[e.id] != e {
+		a.mu.Unlock()
+		return
+	}
+	delete(a.convs, e.id)
+	a.mu.Unlock()
+	if err := e.chat.ServiceShutdown(); err != nil {
+		log.Print("join: ", err)
+	}
+	a.dropFolder(e)
+	a.emitList()
 }
 
 // CancelJoin stops the Join that waits, for the inviter or for its answer.
@@ -545,7 +628,7 @@ func (a *Conversations) List() []ConversationInfo {
 func (e convEntry) info() ConversationInfo {
 	info := ConversationInfo{ID: e.id, Name: e.local.Name, Me: e.me, Joined: e.joined}
 	if e.chat != nil {
-		info.Owner = e.chat.IsOwner()
+		info.Admin = e.chat.IsAdmin()
 	}
 	if e.err != nil {
 		info.Error, info.Folder = e.err.Error(), e.dir
@@ -580,8 +663,8 @@ func (a *Conversations) Rooms(conv string) ([]string, error) {
 	return get(a, conv, (*ChatService).Rooms)
 }
 
-func (a *Conversations) IsOwner(conv string) (bool, error) {
-	return get(a, conv, (*ChatService).IsOwner)
+func (a *Conversations) IsAdmin(conv string) (bool, error) {
+	return get(a, conv, (*ChatService).IsAdmin)
 }
 
 func (a *Conversations) SetProfile(conv, name, avatar string) error {
@@ -590,6 +673,10 @@ func (a *Conversations) SetProfile(conv, name, avatar string) error {
 
 func (a *Conversations) AddRoom(conv, name string) error {
 	return call(a, conv, func(c *ChatService) error { return c.AddRoom(name) })
+}
+
+func (a *Conversations) RemoveMember(conv, key string) error {
+	return call(a, conv, func(c *ChatService) error { return c.RemoveMember(key) })
 }
 
 func (a *Conversations) CreateInvite(conv string, opts InviteOptions) (InviteInfo, error) {
@@ -612,8 +699,8 @@ func (a *Conversations) Revoke(conv, id string) error {
 	return call(a, conv, func(c *ChatService) error { return c.Revoke(id) })
 }
 
-func (a *Conversations) Approve(conv string, request uint64) error {
-	return call(a, conv, func(c *ChatService) error { return c.Approve(request) })
+func (a *Conversations) Approve(conv string, request uint64, admin bool) error {
+	return call(a, conv, func(c *ChatService) error { return c.Approve(request, admin) })
 }
 
 func (a *Conversations) Deny(conv string, request uint64) error {

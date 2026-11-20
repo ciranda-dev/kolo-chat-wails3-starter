@@ -631,10 +631,53 @@ body {
 }
 
 .member__tag {
-  margin-left: auto;
   font-family: var(--mono);
   font-size: 10px;
   color: var(--accent);
+}
+
+.member__name + .member__tag {
+  margin-left: auto;
+}
+
+.room .member__tag {
+  margin-left: 6px;
+}
+
+.room.is-unknown {
+  opacity: 0.55;
+  font-style: italic;
+}
+
+.member__remove {
+  margin-left: auto;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.member__remove:hover {
+  color: var(--text);
+}
+
+.member__tag + .member__remove {
+  margin-left: 4px;
+}
+
+.confirm {
+  margin: 8px 0;
+  padding: 10px 0;
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.confirm .note {
+  padding: 0 8px 8px;
 }
 
 .avatar {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/cipher"
 	"crypto/ed25519"
@@ -21,11 +22,11 @@ import (
 	"sync"
 	"time"
 
+	kolobraid "github.com/ciranda-dev/kolo-braid"
 	koloid "github.com/ciranda-dev/kolo-id"
 	invite "github.com/ciranda-dev/kolo-invite"
 	kolokv "github.com/ciranda-dev/kolo-kv"
 	kololog "github.com/ciranda-dev/kolo-log"
-	kolosecure "github.com/ciranda-dev/kolo-secure"
 	kolostore "github.com/ciranda-dev/kolo-store"
 	koloswarm "github.com/ciranda-dev/kolo-swarm"
 	kolosync "github.com/ciranda-dev/kolo-sync"
@@ -63,6 +64,7 @@ type wireMsg struct {
 	DirHeader []byte `json:"dirHeader,omitempty"` // hello: the signed header of the sender's directory log
 	Proof     []byte `json:"proof,omitempty"`     // hello: proves the sender knows the conversation key
 	Reply     bool   `json:"reply,omitempty"`     // hello: answers a hello, so the sender has registered us
+	Group     []byte `json:"group,omitempty"`     // hello: the ID of the sender's braid, which must be ours
 	Index     uint64 `json:"index,omitempty"`     // msg: the entry's index in the sender's log
 	Sealed    []byte `json:"sealed,omitempty"`    // msg: the entry's value, the text sealed with the conversation key
 	// "dir" has no fields: the sender's directory changed, pull it.
@@ -110,24 +112,48 @@ type ChatService struct {
 	dirMu   sync.Mutex // one write of our directory at a time
 	pubMu   sync.Mutex // one publication of the directory to the window at a time
 
-	mu         sync.Mutex // guards the fields below
-	peers      map[string]*koloswarm.Peer
-	members    map[string]*member
-	replicas   map[string]*kolostore.Replica
-	dirs       map[string]*directory // per member: the read-only copy of its directory
-	owner      ed25519.PublicKey     // the key of the conversation's owner: ours, or the one that invited us
-	lastView   directoryView         // what the window was told last
-	pinned     map[string]uint64     // per author: entries below this index came from the pin
-	locked     map[string]int        // per author: entries that wait for a key
-	pin        pinState
-	active     bool                              // in a conversation: it has its key and its pin
-	joining    *joinAttempt                      // the Join that waits for its inviter
-	cancelJoin context.CancelFunc                // stops that Join
-	requests   map[invite.RequestID]invite.Event // the requests that wait for Approve or Deny
+	mu          sync.Mutex       // guards the fields below
+	links       map[string]*link // the connections of the conversation's topic, by peer key
+	members     map[string]*member
+	replicas    map[string]*kolostore.Replica
+	dirs        map[string]*directory // per member: the read-only copy of its directory
+	lastView    directoryView         // what the window was told last
+	pinned      map[string]uint64     // per author: entries below this index came from the pin
+	locked      map[string]int        // per author: entries that wait for a key
+	pin         pinState
+	active      bool                                // in a conversation: it has its key and its pin
+	joining     *joinAttempt                        // the Join that waits for its inviter
+	cancelJoin  context.CancelFunc                  // stops that Join
+	requests    map[invite.RequestID]pendingRequest // the requests that wait for Approve or Deny
+	accepted    map[string]kolobraid.Member         // the roster of the braid's view, by hex key: who the chat talks to
+	group       kolobraid.GroupID
+	pauses      map[string]*pause // members whose braid is paused after a fault
+	unconfirmed bool              // a braid write ended before our strand was confirmed
+	lastState   []byte            // the last "chat:state", as JSON
 
 	showMu sync.Mutex // one message is shown at a time, so they keep their order
 	pullMu sync.Mutex // one pull at a time, since a replica takes one
 	pushMu sync.Mutex // one push at a time
+
+	braidDB kolostore.Backend // the braid's own store, so a join attempt never shares one
+	braid   *kolobraid.Braid
+}
+
+// link is one connection to a peer of the conversation, split into parts by its mux. Its hello is proven once it
+// proves the conversation key and names our braid; the peer is registered once it is also on the roster.
+type link struct {
+	p      *koloswarm.Peer
+	mx     *mux
+	key    string
+	once   sync.Once
+	proven chan struct{}
+
+	// guarded by ChatService.mu
+	hello      *wireMsg  // its proven hello, kept to register it once it is accepted
+	since      time.Time // when its hello was proven
+	answered   bool      // it sent a reply hello: it accepted us
+	otherGroup bool      // its hello names another braid
+	registered bool
 }
 
 // NewChatService returns a chat that reads cfg when it starts and tells the window what happens through emit.
@@ -171,7 +197,10 @@ func (c *ChatService) start() (err error) {
 	if err = c.openOwnLogs(); err != nil {
 		return err
 	}
-	c.peers = map[string]*koloswarm.Peer{}
+	if c.braidDB, err = openBraidStore(c.set.DataDir); err != nil {
+		return err
+	}
+	c.links = map[string]*link{}
 	c.replicas = map[string]*kolostore.Replica{}
 	c.dirs = map[string]*directory{}
 	c.pinned = map[string]uint64{}
@@ -181,7 +210,7 @@ func (c *ChatService) start() (err error) {
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.push = make(chan struct{}, 1)
-	swarmCfg := &koloswarm.Config{LookupInterval: c.set.LookupInterval, MaxTopics: swarmTopics}
+	swarmCfg := &koloswarm.Config{LookupInterval: c.set.LookupInterval, MaxTopics: swarmTopics, DHT: dhtConfig()}
 	if c.sw, err = koloswarm.New(c.ctx, c.set.Listen, c.id, swarmCfg); err != nil {
 		return err
 	}
@@ -194,19 +223,31 @@ func (c *ChatService) start() (err error) {
 	if err = c.openInvites(); err != nil {
 		return err
 	}
+	_, err = os.Lstat(filepath.Join(c.set.DataDir, "conversation.json"))
+	founder := errors.Is(err, fs.ErrNotExist) // a key from the configuration and no conversation yet: we start it
 	conv, found, err := c.savedConversation() // from the configuration, or from the invite that made us a member
-	if err != nil || !found {
-		return err // a joiner waits for Join
+	if err != nil {
+		return err
 	}
-	return c.enter(conv)
+	if !found { // a joiner waits for Join
+		return c.noBraidYet()
+	}
+	return c.enter(conv, founder)
 }
 
-// enter makes this chat a member of the conversation: it has the key and the pin, offers its log, pulls from the
-// pin first and then from the peers, and joins the conversation's topic. Start calls it for an owner or a member
-// that joined earlier, and Join for a new member.
-func (c *ChatService) enter(conv conversation) (err error) {
+// enter makes this chat a member of the conversation: it has the key and the pin, offers its logs and the braid,
+// pulls from the pin first and then from the peers, and joins the conversation's topic. Start calls it for the
+// founder or a member that joined earlier, and Join for a new member. The conversation is saved once the braid
+// opens: the founder creates it.
+func (c *ChatService) enter(conv conversation, founder bool) (err error) {
 	c.set.useConversation(conv)
 	if c.aead, err = chacha20poly1305.NewX(c.set.conversationKey[:]); err != nil {
+		return err
+	}
+	if err = c.openBraid(founder); err != nil {
+		return err
+	}
+	if err = saveConversation(c.set.DataDir, conv); err != nil {
 		return err
 	}
 	if c.token, err = capability(c.set, c.id, c.log.ID(), c.dirLog.ID()); err != nil {
@@ -220,9 +261,9 @@ func (c *ChatService) enter(conv conversation) (err error) {
 	}
 	c.pinDone = make(chan struct{})
 	c.mu.Lock()
-	c.owner = ed25519.PublicKey(conv.Owner)
 	c.active = true // what the goroutines below read was written before this
 	c.mu.Unlock()
+	c.startBraid() // the accepted set, before anything is pulled
 	c.openDirectories()
 
 	c.wg.Go(c.pushLoop)
@@ -261,6 +302,12 @@ func (c *ChatService) shutdown() error {
 		errs = append(errs, c.inv.Close())
 	}
 	c.wg.Wait()
+	if c.braid != nil {
+		errs = append(errs, c.braid.Close())
+	}
+	if c.braidDB != nil {
+		errs = append(errs, c.braidDB.Close())
+	}
 	c.closeDirectories()
 	if c.store != nil {
 		errs = append(errs, c.store.Close()) // also closes the log and the replicas
@@ -271,7 +318,7 @@ func (c *ChatService) shutdown() error {
 	c.mu.Lock()
 	c.active, c.joining, c.cancelJoin = false, nil, nil
 	c.mu.Unlock()
-	c.id, c.store, c.sw, c.cancel, c.inv, c.invDB = nil, nil, nil, nil, nil, nil
+	c.id, c.store, c.sw, c.cancel, c.inv, c.invDB, c.braid, c.braidDB = nil, nil, nil, nil, nil, nil, nil, nil
 	c.log, c.dirLog, c.dir = nil, nil, nil
 	return errors.Join(errs...)
 }
@@ -312,38 +359,38 @@ func (c *ChatService) route(p *koloswarm.Peer) {
 	}
 }
 
+// addPeer starts the chat with a peer of the conversation's topic: our hello first, then what it sends.
 func (c *ChatService) addPeer(p *koloswarm.Peer) {
-	key := hex.EncodeToString(p.PublicKey())
+	l := &link{p: p, mx: newMux(p.Conn()), key: hex.EncodeToString(p.PublicKey()), proven: make(chan struct{})}
 	c.mu.Lock()
-	c.peers[key] = p
+	c.links[l.key] = l
 	c.mu.Unlock()
-	log.Print("peer connected: ", key[:8])
-	c.emitPeers()
+	log.Print("peer connected: ", l.key[:8])
 
-	if conn, ok := p.Conn().(*kolosecure.Conn); ok { // not for a relayed connection
-		c.wg.Go(func() { c.srv.Serve(c.ctx, conn) })
-	}
+	c.wg.Go(func() { c.serveAfterHello(l) })
+	c.wg.Go(l.mx.acceptUni)
 	c.wg.Go(func() {
 		defer func() {
 			c.mu.Lock()
-			if c.peers[key] == p {
-				delete(c.peers, key)
+			if c.links[l.key] == l {
+				delete(c.links, l.key)
 			}
 			c.mu.Unlock()
-			log.Print("peer gone: ", key[:8])
+			log.Print("peer gone: ", l.key[:8])
 			c.emitPeers()
 		}()
-		if err := c.sendTo(p, c.hello(p, false)); err != nil {
+		if err := c.sendTo(l, c.hello(l, false)); err != nil {
 			log.Print("hello: ", err)
 		}
-		c.receive(p)
+		c.receive(l)
 	})
 }
 
-// receive handles what one peer sends, one stream at a time.
-func (c *ChatService) receive(p *koloswarm.Peer) {
+// receive handles what one peer sends on the connection's 'm' part, one stream at a time.
+func (c *ChatService) receive(l *link) {
+	part := l.mx.part(tagMsg)
 	for {
-		st, err := p.Conn().AcceptUniStream(c.ctx)
+		st, err := part.AcceptUniStream(c.ctx)
 		if err != nil {
 			return
 		}
@@ -359,23 +406,23 @@ func (c *ChatService) receive(p *koloswarm.Peer) {
 		}
 		switch m.Kind {
 		case "hello":
-			c.onHello(p, m)
+			c.onHello(l, m)
 		case "msg":
-			c.onMessage(p, m)
+			c.onMessage(l, m)
 		case "dir":
-			c.onDirectory(p)
+			c.onDirectory(l)
 		}
 	}
 }
 
-func (c *ChatService) sendTo(p *koloswarm.Peer, m wireMsg) error {
+func (c *ChatService) sendTo(l *link, m wireMsg) error {
 	data, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(c.ctx, sendTimeout)
 	defer cancel()
-	st, err := p.Conn().OpenUniStream(ctx)
+	st, err := l.mx.part(tagMsg).OpenUniStream(ctx)
 	if err != nil {
 		return err
 	}
@@ -385,6 +432,19 @@ func (c *ChatService) sendTo(p *koloswarm.Peer, m wireMsg) error {
 		return err
 	}
 	return st.Close()
+}
+
+// registered lists the peers the chat talks to: proven, and on the roster.
+func (c *ChatService) registered() []*link {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []*link
+	for _, l := range c.links {
+		if l.registered {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // Send seals the text, with the room it is for, with the conversation key and appends it to our log. Then it
@@ -411,14 +471,8 @@ func (c *ChatService) Send(room, text string) error {
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
-	peers := make([]*koloswarm.Peer, 0, len(c.peers))
-	for _, p := range c.peers {
-		peers = append(peers, p)
-	}
-	c.mu.Unlock()
-	for _, p := range peers {
-		if err := c.sendTo(p, wireMsg{Kind: "msg", Index: index, Sealed: sealed}); err != nil {
+	for _, l := range c.registered() {
+		if err := c.sendTo(l, wireMsg{Kind: "msg", Index: index, Sealed: sealed}); err != nil {
 			log.Print("direct send: ", err) // the pin and the next sync still carry it
 		}
 	}
@@ -468,12 +522,12 @@ func (c *ChatService) open(author ed25519.PublicKey, sealed []byte) (room, text 
 	return b.Room, b.Text, nil
 }
 
-// hello introduces us: our signed log header, which names our key and log ID, and a proof that we know the
-// conversation key, bound to both keys so it cannot be replayed to another peer. The directory header is how a
+// hello introduces us: our signed log header, which names our key and log ID, a proof that we know the conversation
+// key, bound to both keys so it cannot be replayed to another peer, and our braid's ID. The directory header is how a
 // peer learns which log holds our profile.
-func (c *ChatService) hello(p *koloswarm.Peer, reply bool) wireMsg {
+func (c *ChatService) hello(l *link, reply bool) wireMsg {
 	return wireMsg{Kind: "hello", Header: c.log.Header().Encode(), DirHeader: c.dirLog.Header().Encode(),
-		Proof: c.proof(c.pub, p.PublicKey()), Reply: reply}
+		Proof: c.proof(c.pub, l.p.PublicKey()), Reply: reply, Group: c.group[:]}
 }
 
 func (c *ChatService) proof(from, to ed25519.PublicKey) []byte {
@@ -484,57 +538,105 @@ func (c *ChatService) proof(from, to ed25519.PublicKey) []byte {
 	return mac.Sum(nil)
 }
 
-// onHello registers a peer that proves it knows the conversation key and answers with our own hello. The
-// answer tells the peer that we registered it, so it may pull our log; a hello that is an answer tells us
-// the same, so we may pull its log.
-func (c *ChatService) onHello(p *koloswarm.Peer, m wireMsg) {
-	pub := p.PublicKey()
+// onHello proves a peer's hello: it knows the conversation key and names our braid. A proven peer that is on the
+// roster is registered and answered with our own hello; one that is not yet is kept, and accepted once the roster
+// has it. The answer tells the peer that we registered it, so it may pull our log; a hello that is an answer tells
+// us the same, so we may pull its log.
+func (c *ChatService) onHello(l *link, m wireMsg) {
+	pub := l.p.PublicKey()
 	h, err := kololog.DecodeLogHeader(m.Header)
-	if err != nil || kololog.VerifyLogHeader(pub, h) != nil || !hmac.Equal(m.Proof, c.proof(pub, c.pub)) {
-		log.Print("hello refused from ", hex.EncodeToString(pub)[:8])
+	if err == nil {
+		err = kololog.VerifyLogHeader(pub, h)
+	}
+	if err == nil && !hmac.Equal(m.Proof, c.proof(pub, c.pub)) {
+		err = errors.New("it does not prove the conversation key")
+	}
+	if err == nil {
+		err = checkDirHeader(pub, m.DirHeader, h)
+	}
+	if err != nil {
+		log.Print("hello refused from ", l.key[:8], ": ", err)
 		return
 	}
-	if err := checkDirHeader(pub, m.DirHeader, h); err != nil {
-		log.Print("hello refused from ", hex.EncodeToString(pub)[:8], ": ", err)
-		return
-	}
-	if err := c.addMember(pub, m.Header, m.DirHeader); err != nil {
-		log.Print("member: ", err)
-		return
-	}
-	if !m.Reply {
-		if err := c.sendTo(p, c.hello(p, true)); err != nil {
-			log.Print("hello: ", err)
+	c.mu.Lock()
+	if !bytes.Equal(m.Group, c.group[:]) {
+		first := !l.otherGroup
+		l.otherGroup = true
+		c.mu.Unlock()
+		if first {
+			log.Print("hello from ", l.key[:8], " names another member list")
 		}
 		return
 	}
-	c.wg.Go(func() { c.syncFromPeer(p) })
+	l.hello = &m
+	if l.since.IsZero() {
+		l.since = time.Now()
+	}
+	l.answered = l.answered || m.Reply
+	_, ok := c.accepted[l.key]
+	c.mu.Unlock()
+	l.once.Do(func() { close(l.proven) })
+	if ok {
+		c.accept(l, m, !m.Reply, m.Reply)
+	}
 }
 
-// authorize lets the members of the conversation read our two logs with their entry keys, and nobody else.
-func (c *ChatService) authorize(peer, owner ed25519.PublicKey, logID kololog.LogID) kolosync.Access {
+// accept registers a proven peer that is on the roster. answer sends it a reply hello, and sync pulls from it.
+func (c *ChatService) accept(l *link, m wireMsg, answer, sync bool) {
+	if err := c.addMember(l.p.PublicKey(), m.Header, m.DirHeader); err != nil {
+		log.Print("member: ", err)
+		return
+	}
 	c.mu.Lock()
-	_, ok := c.members[hex.EncodeToString(peer)]
+	if c.links[l.key] != l {
+		c.mu.Unlock()
+		return
+	}
+	was := l.registered
+	l.registered = true
 	c.mu.Unlock()
-	if ok && owner.Equal(c.pub) && (logID == c.log.ID() || logID == c.dirLog.ID()) {
+	if !was {
+		c.emitPeers()
+	}
+	if answer {
+		if err := c.sendTo(l, c.hello(l, true)); err != nil {
+			log.Print("hello: ", err)
+		}
+	}
+	if sync {
+		c.wg.Go(func() { c.syncFromPeer(l) })
+	}
+}
+
+// authorize lets the members on the roster read our two logs with their entry keys, and nobody else.
+func (c *ChatService) authorize(peer, owner ed25519.PublicKey, logID kololog.LogID) kolosync.Access {
+	if c.isAccepted(hex.EncodeToString(peer)) && owner.Equal(c.pub) && (logID == c.log.ID() || logID == c.dirLog.ID()) {
 		return kolosync.Keys
 	}
 	return kolosync.NoAccess
 }
 
 // onMessage shows a message that arrives directly if it is the next one of its sender, and drops it if it was
-// shown already. A gap means we missed some: a sync from the sender shows them all, in order.
-func (c *ChatService) onMessage(p *koloswarm.Peer, m wireMsg) {
-	author := hex.EncodeToString(p.PublicKey())
+// shown already. Only a peer whose hello was proven and who is on the roster is heard. A gap means we missed some:
+// a sync from the sender shows them all, in order.
+func (c *ChatService) onMessage(l *link, m wireMsg) {
+	c.mu.Lock()
+	_, ok := c.accepted[l.key]
+	ok = ok && l.hello != nil
+	c.mu.Unlock()
+	if !ok {
+		return
+	}
+	author := l.key
 	c.showMu.Lock()
 	defer c.showMu.Unlock()
 	next, known := c.shown(author)
 	switch {
 	case !known: // its hello is not here yet, and the sync that follows it brings this message too
 	case m.Index > next:
-		c.wg.Go(func() { c.syncFromPeer(p) })
+		c.wg.Go(func() { c.syncFromPeer(l) })
 	case m.Index == next:
-		room, text, err := c.open(p.PublicKey(), m.Sealed)
+		room, text, err := c.open(l.p.PublicKey(), m.Sealed)
 		if err != nil {
 			log.Print("direct message refused: ", err)
 			return
@@ -545,13 +647,14 @@ func (c *ChatService) onMessage(p *koloswarm.Peer, m wireMsg) {
 }
 
 // syncFromPeer pulls the sender's log and its directory from the sender, with their entry keys, and shows what
-// is new. It waits for the pull from the pin at start, so what the pin has is taken from the pin.
-func (c *ChatService) syncFromPeer(p *koloswarm.Peer) {
-	conn, ok := c.afterPin(p)
-	if !ok {
+// is new. It waits for the pull from the pin at start, so what the pin has is taken from the pin. A member who is
+// not on the roster is not pulled.
+func (c *ChatService) syncFromPeer(l *link) {
+	conn, ok := c.afterPin(l)
+	author := l.key
+	if !ok || !c.isAccepted(author) {
 		return
 	}
-	author := hex.EncodeToString(p.PublicKey())
 	rep, err := c.replica(author)
 	if err != nil {
 		log.Print("replica: ", err)
@@ -570,21 +673,23 @@ func (c *ChatService) syncFromPeer(p *koloswarm.Peer) {
 	c.syncDirectory(conn, author)
 }
 
-// afterPin waits for the pull from the pin at start, and returns the peer's connection if it can be synced.
-func (c *ChatService) afterPin(p *koloswarm.Peer) (*kolosecure.Conn, bool) {
+// afterPin waits for the pull from the pin at start, and returns the 's' part of the peer's connection.
+func (c *ChatService) afterPin(l *link) (kolosync.Conn, bool) {
 	select {
 	case <-c.pinDone:
 	case <-c.ctx.Done():
 		return nil, false
 	}
-	conn, ok := p.Conn().(*kolosecure.Conn)
-	return conn, ok
+	return l.mx.part(tagSync), true
 }
 
 // show gives the window the messages of an author that it has not seen, in the order of the author's log. It
 // stops at the first entry whose key is missing: the pin sent the ciphertext, and the key comes only from the
-// author, so the entry waits and nothing after it jumps ahead.
+// author, so the entry waits and nothing after it jumps ahead. One not on the roster shows nothing more.
 func (c *ChatService) show(author string) {
+	if !c.isAccepted(author) {
+		return
+	}
 	c.showMu.Lock()
 	defer c.showMu.Unlock()
 	rep, err := c.replica(author)
@@ -647,10 +752,7 @@ func (c *ChatService) pushSoon() {
 }
 
 func (c *ChatService) emitPeers() {
-	c.mu.Lock()
-	n := len(c.peers)
-	c.mu.Unlock()
-	c.emit("chat:peers", n)
+	c.emit("chat:peers", len(c.registered()))
 }
 
 // setPin changes the pin's state under the lock and tells the window.
@@ -745,7 +847,7 @@ func (c *ChatService) setShown(author string, n uint64) {
 }
 
 // addMember registers a member from its signed headers. A member we know gets its directory header when it
-// first sends one. The owner also writes every new member in the member list.
+// first sends one.
 func (c *ChatService) addMember(pub ed25519.PublicKey, header, dirHeader []byte) error {
 	author := hex.EncodeToString(pub)
 	c.mu.Lock()
@@ -761,15 +863,12 @@ func (c *ChatService) addMember(pub ed25519.PublicKey, header, dirHeader []byte)
 	}
 	err := saveMembers(c.set.DataDir, c.members)
 	c.mu.Unlock()
-	if err == nil && !known && c.recordMember(author) {
-		c.directoryChanged()
-	}
 	return err
 }
 
 func loadMembers(dir string) (map[string]*member, error) {
 	members := map[string]*member{}
-	data, err := os.ReadFile(filepath.Join(dir, "members.json"))
+	data, err := readFile(filepath.Join(dir, "members.json"), maxStateFile)
 	if errors.Is(err, fs.ErrNotExist) {
 		return members, nil
 	}

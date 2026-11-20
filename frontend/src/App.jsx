@@ -7,10 +7,11 @@ import { JoinPanel, InvitePanel, Requests } from './Invite.jsx'
 import { Modal } from './Modal.jsx'
 import { ProfilePanel, Sidebar, labelFor } from './Profile.jsx'
 import { convOf, initialState, reduce, shownRows } from './conversations.js'
+import { isAdmin, shownRooms, stateBanners } from './state.js'
 import './chat.css'
 
 /** The events of the conversations, each { conv, data }; "chat:join" and "chat:invite" go to their panels. */
-const CHAT_EVENTS = ['chat:msg', 'chat:peers', 'chat:pin', 'chat:profiles', 'chat:rooms', 'chat:invite-request']
+const CHAT_EVENTS = ['chat:msg', 'chat:peers', 'chat:pin', 'chat:profiles', 'chat:rooms', 'chat:invite-request', 'chat:state']
 
 /** First 8 characters of a kolo-id, enough to tell peers apart. */
 const shortId = (id) => (id ? id.slice(0, 8) : '')
@@ -99,6 +100,8 @@ function App() {
   }
 
   const mine = conv.members.find((m) => m.key === row?.me)
+  const admin = joined && (row.admin || isAdmin(conv.members, row.me)) // the list says it first, the member list once synced
+  const knownRoom = conv.rooms.includes(room)
   const shown = conv.messages.filter((m) => m.room === room)
   const status = startError || row?.error ? 'error' : conv.peers > 0 ? 'live' : 'waiting'
   const badge = status === 'live' ? `${conv.peers} ${conv.peers === 1 ? 'peer' : 'peers'}` : status === 'error' ? 'Error' : 'Waiting for peer'
@@ -121,7 +124,7 @@ function App() {
             Profile
           </button>
         ) : null}
-        {joined ? (
+        {admin ? (
           <button type="button" className="header__btn" onClick={() => setInviting((open) => !open)}>
             Invite{conv.requests.length > 0 ? ` (${conv.requests.length})` : ''}
           </button>
@@ -129,7 +132,7 @@ function App() {
         <span className={`header__badge is-${status}`}>{badge}</span>
       </header>
 
-      {joined && inviting ? (
+      {admin && inviting ? (
         <Modal title={`Invite someone to ${row.name}`} onClose={() => setInviting(false)}>
           <InvitePanel conv={row.id} />
         </Modal>
@@ -156,7 +159,8 @@ function App() {
           />
         )}
         {joined && view === 'chat' ? (
-          <Sidebar conv={row.id} rooms={conv.rooms} room={room} onRoom={setRoom} members={conv.members} isOwner={row.owner} />
+          <Sidebar conv={row.id} rooms={shownRooms(conv.rooms, conv.messages, conv.state.pendingRooms)} room={room} onRoom={setRoom}
+            members={conv.members} me={row.me} />
         ) : null}
         <div className="main">
           {view === 'join' ? <JoinPanel empty={rows.length === 0} onJoined={added} /> : null}
@@ -197,6 +201,7 @@ function App() {
           {joined ? (
             <Requests conv={row.id} requests={conv.requests} onDone={(request) => dispatch({ type: 'request-done', conv: row.id, request })} />
           ) : null}
+          {joined ? stateBanners(conv.state).map((text) => <p key={text} className="note">{text}</p>) : null}
           {error ? <p className="error">{error}</p> : null}
           {joined && conv.pin.error ? <p className="error">{conv.pin.error}</p> : null}
           {joined && !conv.pin.error && conv.pin.locked > 0 ? (
@@ -205,7 +210,8 @@ function App() {
             </p>
           ) : null}
 
-          {view === 'chat' && joined ? (
+          {view === 'chat' && joined && !knownRoom ? <p className="note"># {room}: not in your room list yet</p> : null}
+          {view === 'chat' && joined && knownRoom ? (
             <form
               className="composer"
               onSubmit={(ev) => {

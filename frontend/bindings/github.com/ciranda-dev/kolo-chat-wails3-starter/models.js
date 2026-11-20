@@ -93,12 +93,12 @@ export class ConversationInfo {
              */
             this["joined"] = false;
         }
-        if (!("owner" in $$source)) {
+        if (!("admin" in $$source)) {
             /**
              * @member
              * @type {boolean}
              */
-            this["owner"] = false;
+            this["admin"] = false;
         }
         if (!("error" in $$source)) {
             /**
@@ -175,13 +175,6 @@ export class InviteInfo {
              */
             this["used"] = 0;
         }
-        if (!("requireApproval" in $$source)) {
-            /**
-             * @member
-             * @type {boolean}
-             */
-            this["requireApproval"] = false;
-        }
         if (!("state" in $$source)) {
             /**
              * "active", "expired", "used up" or "revoked"
@@ -206,7 +199,8 @@ export class InviteInfo {
 }
 
 /**
- * InviteOptions is what the owner chooses for a new invite. A zero TTLSeconds is one day, a zero Uses is one.
+ * InviteOptions is what an admin chooses for a new invite. A zero TTLSeconds is one day, a zero Uses is one. Every
+ * joiner waits for an admin's approval.
  */
 export class InviteOptions {
     /**
@@ -228,13 +222,6 @@ export class InviteOptions {
              */
             this["uses"] = 0;
         }
-        if (!("requireApproval" in $$source)) {
-            /**
-             * @member
-             * @type {boolean}
-             */
-            this["requireApproval"] = false;
-        }
 
         Object.assign(this, $$source);
     }
@@ -252,7 +239,8 @@ export class InviteOptions {
 
 /**
  * Member is a member of the conversation as the window shows it. Name and Avatar are empty until the member's
- * profile has been read.
+ * profile has been read. Admin may invite, approve, remove and add rooms; Seat is the member who settles changes to
+ * the lists (the founder), which nobody can remove. Pending says its admission is not settled yet.
  */
 export class Member {
     /**
@@ -282,12 +270,26 @@ export class Member {
              */
             this["avatar"] = "";
         }
-        if (!("owner" in $$source)) {
+        if (!("admin" in $$source)) {
             /**
              * @member
              * @type {boolean}
              */
-            this["owner"] = false;
+            this["admin"] = false;
+        }
+        if (!("seat" in $$source)) {
+            /**
+             * @member
+             * @type {boolean}
+             */
+            this["seat"] = false;
+        }
+        if (!("pending" in $$source)) {
+            /**
+             * @member
+             * @type {boolean}
+             */
+            this["pending"] = false;
         }
 
         Object.assign(this, $$source);

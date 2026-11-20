@@ -33,6 +33,7 @@ type events struct {
 	invites  []InviteInfo
 	profiles [][]Member
 	rooms    [][]string
+	states   []StateStatus
 	all      []string
 }
 
@@ -54,10 +55,22 @@ func (e *events) emit(name string, data any) {
 		e.profiles = append(e.profiles, v)
 	case []string:
 		e.rooms = append(e.rooms, v)
+	case StateStatus:
+		e.states = append(e.states, v)
 	}
 	if b, err := json.Marshal(data); err == nil {
 		e.all = append(e.all, name+" "+string(b))
 	}
+}
+
+// state is the last "chat:state".
+func (e *events) state() StateStatus {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.states) == 0 {
+		return StateStatus{}
+	}
+	return e.states[len(e.states)-1]
 }
 
 func (e *events) messages() []ChatMsg {
@@ -169,14 +182,17 @@ func start(t *testing.T, cfg Config) (*ChatService, *events) {
 	return c, ev
 }
 
+// knows says that c registered other: other proved the conversation key, is on c's member list and has a link.
 func knows(c, other *ChatService) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, ok := c.members[hex.EncodeToString(other.pub)]
-	return ok
+	key := hex.EncodeToString(other.pub)
+	_, ok := c.members[key]
+	l := c.links[key]
+	return ok && l != nil && l.registered
 }
 
-// introduced waits until the two chats have connected and exchanged their hellos.
+// introduced waits until the two chats have connected, exchanged their hellos and accepted each other.
 func introduced(t *testing.T, a, b *ChatService) {
 	t.Helper()
 	eventually(t, "the peers to meet", func() bool { return knows(a, b) && knows(b, a) })
@@ -203,7 +219,7 @@ func texts(msgs []ChatMsg) []string {
 func TestDirectDeliveryAlsoWritesLogAndPin(t *testing.T) {
 	n := newNetwork(t)
 	a, _ := start(t, n.config(dataDir(t)))
-	b, bev := start(t, n.config(dataDir(t)))
+	b, bev := n.member(t, a, dataDir(t))
 	introduced(t, a, b)
 
 	if err := a.Send(defaultRoom, "hello"); err != nil {
@@ -238,7 +254,7 @@ func TestMissedMessagesComeFromThePin(t *testing.T) {
 	n := newNetwork(t)
 	a, _ := start(t, n.config(dataDir(t)))
 	bdir := dataDir(t)
-	b, bev := start(t, n.config(bdir))
+	b, bev := n.member(t, a, bdir)
 	introduced(t, a, b)
 
 	a.Send(defaultRoom, "one")
@@ -280,7 +296,7 @@ func TestPinnedMessagesWaitForTheSendersKey(t *testing.T) {
 	n := newNetwork(t)
 	adir, bdir := dataDir(t), dataDir(t)
 	a, _ := start(t, n.config(adir))
-	b, _ := start(t, n.config(bdir))
+	b, _ := n.member(t, a, bdir)
 	introduced(t, a, b)
 	b.ServiceShutdown()
 
@@ -355,7 +371,7 @@ func TestPinRefusesUnknownOwner(t *testing.T) {
 	peer, _ := startPin(t, stranger.PublicKey()) // accepts only the stranger
 	n := network{bootstrap: startBootstrap(t), pin: peer}
 	a, _ := start(t, n.config(dataDir(t)))
-	b, bev := start(t, n.config(dataDir(t)))
+	b, bev := n.member(t, a, dataDir(t))
 	introduced(t, a, b)
 
 	a.Send(defaultRoom, "still direct")
@@ -401,7 +417,7 @@ func TestQuotaFullIsReported(t *testing.T) {
 	cfg := n.config(dataDir(t))
 	cfg.PinQuota = 2048
 	a, aev := start(t, cfg)
-	b, bev := start(t, n.config(dataDir(t)))
+	b, bev := n.member(t, a, dataDir(t))
 	introduced(t, a, b)
 
 	const total = 12

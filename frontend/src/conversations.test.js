@@ -62,3 +62,11 @@ test('each conversation keeps its own draft, and sending clears only its own', (
   assert.equal(convOf(s, 'a').draft, '')
   assert.equal(convOf(s, 'b').draft, 'reply to work')
 })
+
+test('chat:state reaches its conversation only, with every field in place', () => {
+  let state = reduce(initialState, { type: 'list', list: [{ id: 'a', joined: true }, { id: 'b', joined: true }] })
+  state = reduce(state, { type: 'event', name: 'chat:state', payload: { conv: 'a', data: { paused: 2, pendingRooms: null } } })
+  assert.equal(convOf(state, 'a').state.paused, 2)
+  assert.deepEqual(convOf(state, 'a').state.pendingRooms, [])
+  assert.equal(convOf(state, 'b').state.paused, 0)
+})

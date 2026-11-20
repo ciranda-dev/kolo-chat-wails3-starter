@@ -1,3 +1,5 @@
+import { stateStatus } from './state.js'
+
 /** @typedef {{ id: number, from: string, room: string, text: string, mine: boolean, via: string }} Msg */
 
 /** value when it is a list, else fallback: Go sends a nil slice as null. */
@@ -11,6 +13,7 @@ export const emptyConv = () => ({
   members: [],
   rooms: ['general'],
   requests: [],
+  state: stateStatus(null),
   unread: 0,
   draft: '',
 })
@@ -88,6 +91,9 @@ function onEvent(state, name, payload) {
       break
     case 'chat:rooms':
       next = { ...c, rooms: list(data, ['general']) }
+      break
+    case 'chat:state':
+      next = { ...c, state: stateStatus(data) }
       break
     case 'chat:invite-request': {
       if (!data) {

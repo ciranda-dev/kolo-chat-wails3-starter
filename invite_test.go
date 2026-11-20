@@ -126,8 +126,8 @@ func linked(t *testing.T, a, b *ChatService) {
 	has := func(c, other *ChatService) bool {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		_, ok := c.peers[hex.EncodeToString(other.pub)]
-		return ok
+		l, ok := c.links[hex.EncodeToString(other.pub)]
+		return ok && l.registered
 	}
 	eventually(t, "the chats to connect", func() bool { return has(a, b) && has(b, a) })
 }
@@ -155,10 +155,10 @@ func TestInviteJoinAndChat(t *testing.T) {
 	}
 	var codes []string
 
-	// B joins with an invite that needs approval, and gets in when the owner approves.
-	first := mustCreate(t, a, InviteOptions{TTLSeconds: 3600, Uses: 1, RequireApproval: true})
+	// B joins with an invite, and gets in when an admin approves.
+	first := mustCreate(t, a, InviteOptions{TTLSeconds: 3600, Uses: 1})
 	codes = append(codes, first.Code)
-	if !first.RequireApproval || first.State != "active" || first.Uses != 1 || first.Expires == "" {
+	if first.State != "active" || first.Uses != 1 || first.Expires == "" {
 		t.Fatalf("got %+v", first)
 	}
 	joining := joinAsync(b, first.Code)
@@ -172,7 +172,7 @@ func TestInviteJoinAndChat(t *testing.T) {
 		t.Fatalf("Join returned before the owner answered: %v", err)
 	case <-time.After(500 * time.Millisecond):
 	}
-	if err := a.Approve(req.Request); err != nil {
+	if err := a.Approve(req.Request, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := waitJoin(t, joining); err != nil {
@@ -230,7 +230,7 @@ func TestInviteJoinAndChat(t *testing.T) {
 	refused(t, c.Join("not an invite"), invite.ErrInvalidCode, "not an invite code")
 
 	// A denied request fails clearly, and the owner is told the request is gone when C leaves.
-	manual := mustCreate(t, a, InviteOptions{TTLSeconds: 3600, Uses: 2, RequireApproval: true})
+	manual := mustCreate(t, a, InviteOptions{TTLSeconds: 3600, Uses: 2})
 	codes = append(codes, manual.Code)
 	denied := joinAsync(c, manual.Code)
 	// Answering B's request told the window it is gone, so Approve and Deny leave the screen.
@@ -246,7 +246,7 @@ func TestInviteJoinAndChat(t *testing.T) {
 		t.Fatal(err)
 	}
 	refused(t, waitJoin(t, denied), invite.ErrDenied, "denied")
-	if err := a.Approve(req.Request); !errors.Is(err, invite.ErrNotFound) {
+	if err := a.Approve(req.Request, false); !errors.Is(err, invite.ErrNotFound) {
 		t.Fatalf("an answered request is gone, got %v", err)
 	}
 
@@ -295,10 +295,10 @@ func TestInviteJoinAndChat(t *testing.T) {
 		t.Fatalf("got %+v", m)
 	}
 
-	// C finally joins with an invite that needs no approval, and the owner is told who came.
+	// C finally joins with a new invite.
 	open := mustCreate(t, a, InviteOptions{TTLSeconds: 3600, Uses: 1})
 	codes = append(codes, open.Code)
-	if err := c.Join(open.Code); err != nil {
+	if err := waitJoin(t, approveJoin(t, a, c.pub, joinAsync(c, open.Code), false)); err != nil {
 		t.Fatal(err)
 	}
 	linked(t, a, c)
@@ -330,7 +330,7 @@ func TestReadGrantRefusesBadPayloads(t *testing.T) {
 	n := newNetwork(t)
 	owner, _ := start(t, n.config(dataDir(t)))
 	other, _ := start(t, n.config(dataDir(t)))
-	good, err := owner.grantPayload()
+	good, err := owner.grantPayload([]byte("welcome"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,11 +348,13 @@ func TestReadGrantRefusesBadPayloads(t *testing.T) {
 	for name, payload := range map[string][]byte{
 		"not JSON":      []byte("nope"),
 		"empty":         nil,
-		"other version": with(func(v *grant) { v.Version = 2 }),
+		"other version": with(func(v *grant) { v.Version = 3 }),
 		"short key":     with(func(v *grant) { v.Key = v.Key[:16] }),
 		"no pin key":    with(func(v *grant) { v.PinKey = nil }),
 		"bad pin":       with(func(v *grant) { v.PinAddr = "pin.example" }),
 		"no header":     with(func(v *grant) { v.Header = nil }),
+		"version 1":     with(func(v *grant) { v.Version = 1 }),
+		"no welcome":    with(func(v *grant) { v.Welcome = nil }),
 	} {
 		if _, err := readGrant(payload, owner.pub); !errors.Is(err, invite.ErrProtocol) {
 			t.Errorf("%s: got %v", name, err)
@@ -375,8 +377,8 @@ func TestInviteOptionsAreChecked(t *testing.T) {
 			t.Errorf("%s must fail", name)
 		}
 	}
-	info := mustCreate(t, a, InviteOptions{}) // the defaults: one day, one use, no approval
-	if info.Uses != 1 || info.RequireApproval {
+	info := mustCreate(t, a, InviteOptions{}) // the defaults: one day, one use
+	if info.Uses != 1 {
 		t.Fatalf("got %+v", info)
 	}
 	if exp, err := time.Parse(time.RFC3339, info.Expires); err != nil || time.Until(exp) < 23*time.Hour {
@@ -414,10 +416,11 @@ func TestJoinerConfig(t *testing.T) {
 func TestConversationOfTheDataDirectoryWins(t *testing.T) {
 	n := newNetwork(t)
 	dir := dataDir(t)
-	other := conversation{Key: bytes.Repeat([]byte{7}, 32), PinAddr: n.pin.Addr, PinKey: n.pin.ID}
-	if err := saveConversation(dir, other); err != nil {
-		t.Fatal(err)
-	}
+	ocfg := n.config(dataDir(t))
+	ocfg.ConversationKey = strings.Repeat("07", 32)
+	o, _ := start(t, ocfg)
+	b0, _ := n.member(t, o, dir)
+	b0.ServiceShutdown()
 	_, err := NewChatService(n.config(dir), (&events{}).emit).Start()
 	var ce *ConfigError
 	if !errors.As(err, &ce) || ce.Setting != "conversation-key" {
