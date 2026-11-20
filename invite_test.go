@@ -394,20 +394,19 @@ func TestInviteOptionsAreChecked(t *testing.T) {
 	mustCreate(t, a, InviteOptions{}) // a revoked invite makes room
 }
 
-// A joiner starts without a key or a pin, and the pin settings alone are not a joiner.
+// A joiner starts without a key or a pin. A pin alone is the one of the conversations started in the window, and a
+// token alone is refused: it is for the key's conversation.
 func TestJoinerConfig(t *testing.T) {
 	set, err := (Config{}).resolve()
 	if err != nil || set.inConversation {
 		t.Fatalf("got %+v, %v", set, err)
 	}
-	for name, cfg := range map[string]Config{
-		"a pin key": {PinKey: testKey},
-		"a token":   {PinToken: "00"},
-	} {
-		var ce *ConfigError
-		if _, err := cfg.resolve(); !errors.Is(err, ErrMissing) || !errors.As(err, &ce) || ce.Setting != "conversation-key" {
-			t.Errorf("%s without a conversation key: got %v", name, err)
-		}
+	if set, err := (Config{PinKey: testKey}).resolve(); err != nil || set.inConversation || len(set.pinKey) != 32 {
+		t.Errorf("a pin key without a conversation key: got %+v, %v", set.pinKey, err)
+	}
+	var ce *ConfigError
+	if _, err := (Config{PinToken: "00"}).resolve(); !errors.Is(err, ErrMissing) || !errors.As(err, &ce) || ce.Setting != "conversation-key" {
+		t.Errorf("a token without a conversation key: got %v", err)
 	}
 }
 

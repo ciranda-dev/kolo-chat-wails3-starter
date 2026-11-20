@@ -483,7 +483,8 @@ func (c *ChatService) becomeMember(g grant, inviter ed25519.PublicKey) error {
 }
 
 // savedConversation returns the conversation this chat is in at start: the one in the configuration, or the one
-// an invite gave earlier. A joiner that has none yet returns false.
+// the data directory keeps, from an invite or from an earlier start with a key. A joiner that has none yet returns
+// false. The configured one is kept, so the app finds it again after a restart.
 func (c *ChatService) savedConversation() (conversation, bool, error) {
 	saved, found, err := loadConversation(c.set.DataDir)
 	if err != nil {
@@ -499,6 +500,9 @@ func (c *ChatService) savedConversation() (conversation, bool, error) {
 	}
 	if found {
 		mine.Owner = saved.Owner // a member that also has the key is still a member
+	}
+	if err := saveConversation(c.set.DataDir, mine); err != nil {
+		return mine, false, err
 	}
 	return mine, true, nil
 }

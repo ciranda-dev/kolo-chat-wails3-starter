@@ -26,7 +26,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// The chat tells the window what happens by emitting events; the Wails app is only needed once one is.
+	// Each conversation tells the window what happens by emitting events; the Wails app is only needed once one is.
 	emit := func(name string, data any) { application.Get().Event.Emit(name, data) }
 
 	app := application.New(application.Options{
@@ -34,7 +34,7 @@ func main() {
 		Description: "Peer-to-peer desktop chat built with Kolo",
 		Icon:        appIcon,
 		Services: []application.Service{
-			application.NewService(NewChatService(cfg, emit)),
+			application.NewService(NewConversations(cfg, emit)),
 		},
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),

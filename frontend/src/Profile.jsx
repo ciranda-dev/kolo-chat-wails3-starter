@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { SetProfile, AddRoom } from "../bindings/github.com/ciranda-dev/kolo-chat-wails3-starter/chatservice.js"
+import { SetProfile, AddRoom } from "../bindings/github.com/ciranda-dev/kolo-chat-wails3-starter/conversations.js"
 
 /** @typedef {{ key: string, name: string, avatar: string, owner: boolean }} Member */
 
@@ -33,8 +33,8 @@ function Avatar({ member }) {
   return <span className="avatar" aria-hidden="true">{member.avatar || (member.name || '?').slice(0, 1).toUpperCase()}</span>
 }
 
-/** Change your name and avatar. The avatar is a short reference, such as an emoji, not an image. */
-export function ProfilePanel({ mine, onDone }) {
+/** Change your name and avatar in the conversation conv. The avatar is a short reference, such as an emoji, not an image. */
+export function ProfilePanel({ conv, mine, onDone }) {
   const [name, setName] = useState(mine?.name ?? '')
   const [avatar, setAvatar] = useState(mine?.avatar ?? '')
   const [error, setError] = useState('')
@@ -42,7 +42,7 @@ export function ProfilePanel({ mine, onDone }) {
   const save = (ev) => {
     ev.preventDefault()
     setError('')
-    SetProfile(name, avatar)
+    SetProfile(conv, name, avatar)
       .then(() => onDone())
       .catch((err) => setError(errorText(err)))
   }
@@ -65,8 +65,8 @@ export function ProfilePanel({ mine, onDone }) {
   )
 }
 
-/** The rooms (the owner can add one) and the members of the conversation. */
-export function Sidebar({ rooms, room, onRoom, members, isOwner }) {
+/** The rooms (the owner can add one) and the members of the conversation conv. */
+export function Sidebar({ conv, rooms, room, onRoom, members, isOwner }) {
   const [adding, setAdding] = useState('')
   const [error, setError] = useState('')
 
@@ -76,7 +76,7 @@ export function Sidebar({ rooms, room, onRoom, members, isOwner }) {
       return
     }
     setError('')
-    AddRoom(adding)
+    AddRoom(conv, adding)
       .then(() => setAdding(''))
       .catch((err) => setError(errorText(err)))
   }

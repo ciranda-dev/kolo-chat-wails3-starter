@@ -82,6 +82,8 @@ type pinState struct {
 	Entries, Used, Quota uint64
 }
 
+// ChatService is the engine of one conversation: its own kolo-id, swarm, logs, pin and invites in its own folder.
+// Conversations runs one per conversation and routes the window's calls to it.
 type ChatService struct {
 	cfg  Config
 	emit func(name string, data any)
@@ -240,7 +242,7 @@ func (c *ChatService) enter(conv conversation) (err error) {
 	return nil
 }
 
-// ServiceShutdown stops the chat and closes the store. Wails calls it when the app quits.
+// ServiceShutdown stops the chat and closes the store. Conversations calls it when the app quits.
 func (c *ChatService) ServiceShutdown() error {
 	c.startMu.Lock()
 	defer c.startMu.Unlock()

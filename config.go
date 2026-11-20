@@ -31,6 +31,8 @@ var ErrConfig = errors.New("invalid configuration")
 var (
 	ErrMissing   = errors.New("is required")
 	ErrMalformed = errors.New("is malformed")
+
+	errFixedPort = errors.New("has a fixed port, which only one conversation can use: use port 0")
 )
 
 // ConfigError names the setting that is wrong and why. errors.Is(err, ErrConfig) is true for every one, and
@@ -49,13 +51,13 @@ func (e *ConfigError) Is(target error) bool {
 // Config is everything the chat needs from outside. A zero field takes its default, if it has one.
 // LoadConfig fills it from flags and environment variables.
 type Config struct {
-	DataDir         string        // -data, KOLO_CHAT_DATA: identity, Pebble store, members. Default: <user config dir>/kolo-chat
+	DataDir         string        // -data, KOLO_CHAT_DATA: one folder per conversation, see conversations.go. Default: <user config dir>/kolo-chat
 	Bootstrap       string        // -bootstrap, KOLO_CHAT_BOOTSTRAP: IP:PORT of a bootstrap node. Default 127.0.0.1:4000
-	Listen          string        // -listen, KOLO_CHAT_LISTEN: local IP:PORT. Default 127.0.0.1:0
-	ConversationKey string        // -conversation-key, KOLO_CHAT_CONVERSATION_KEY: 64 hex characters (32 bytes). Empty for someone who joins with an invite
-	PinAddr         string        // -pin, KOLO_CHAT_PIN: IP:PORT of the pin. Default 127.0.0.1:7450. Used with a conversation key; a joiner gets the pin from the invite
-	PinKey          string        // -pin-key, KOLO_CHAT_PIN_KEY: the pin's public key in hex (`kolo-pin id`). Required with a conversation key
-	PinToken        string        // -pin-token, KOLO_CHAT_PIN_TOKEN: a capability in hex, issued by this app's identity. Default: the app issues one
+	Listen          string        // -listen, KOLO_CHAT_LISTEN: local IP:PORT of every conversation. Default 127.0.0.1:0; a fixed port allows one conversation
+	ConversationKey string        // -conversation-key, KOLO_CHAT_CONVERSATION_KEY: 64 hex characters (32 bytes), the key of one conversation, kept in its folder. Empty to start conversations in the window or join with an invite
+	PinAddr         string        // -pin, KOLO_CHAT_PIN: IP:PORT of the pin. Default 127.0.0.1:7450. The pin of the conversations started here; a joiner gets the pin from the invite
+	PinKey          string        // -pin-key, KOLO_CHAT_PIN_KEY: the pin's public key in hex (`kolo-pin id`). Required with a conversation key and to start conversations in the window
+	PinToken        string        // -pin-token, KOLO_CHAT_PIN_TOKEN: a capability in hex for the -conversation-key conversation, issued by its kolo-id. Default: the app issues one
 	PinTTL          time.Duration // -pin-ttl, KOLO_CHAT_PIN_TTL: lifetime of the capability the app issues. Default 720h
 	PinQuota        uint64        // -pin-quota, KOLO_CHAT_PIN_QUOTA: bytes the pin may keep for you, in the capability the app issues. Default 16777216
 	LookupInterval  time.Duration // -lookup-interval, KOLO_CHAT_LOOKUP_INTERVAL: time between topic lookups. Default 5s
@@ -83,10 +85,10 @@ func LoadConfig(args []string, getenv func(string) string, stderr io.Writer) (Co
 		{"data", "KOLO_CHAT_DATA", "data directory (default <user config dir>/kolo-chat)", text(&c.DataDir)},
 		{"bootstrap", "KOLO_CHAT_BOOTSTRAP", "IP:PORT of the bootstrap node (default " + defaultBootstrap + ")", text(&c.Bootstrap)},
 		{"listen", "KOLO_CHAT_LISTEN", "local IP:PORT to listen on (default " + defaultListen + ")", text(&c.Listen)},
-		{"conversation-key", "KOLO_CHAT_CONVERSATION_KEY", "32-byte key of the conversation, in hex (leave it out to join with an invite)", text(&c.ConversationKey)},
+		{"conversation-key", "KOLO_CHAT_CONVERSATION_KEY", "32-byte key of one conversation, in hex (leave it out to start conversations in the window or join with an invite)", text(&c.ConversationKey)},
 		{"pin", "KOLO_CHAT_PIN", "IP:PORT of the pin (default " + defaultPinAddr + ")", text(&c.PinAddr)},
-		{"pin-key", "KOLO_CHAT_PIN_KEY", "public key of the pin, in hex (required with -conversation-key)", text(&c.PinKey)},
-		{"pin-token", "KOLO_CHAT_PIN_TOKEN", "capability for the pin, in hex (default: issued by the app)", text(&c.PinToken)},
+		{"pin-key", "KOLO_CHAT_PIN_KEY", "public key of the pin, in hex: the pin of the conversations you start (required with -conversation-key)", text(&c.PinKey)},
+		{"pin-token", "KOLO_CHAT_PIN_TOKEN", "capability for the pin of the -conversation-key conversation, in hex (default: issued by the app)", text(&c.PinToken)},
 		{"pin-ttl", "KOLO_CHAT_PIN_TTL", "lifetime of the capability the app issues (default 720h)", dur(&c.PinTTL)},
 		{"pin-quota", "KOLO_CHAT_PIN_QUOTA", "bytes the pin may keep for you (default 16777216)", num(&c.PinQuota)},
 		{"lookup-interval", "KOLO_CHAT_LOOKUP_INTERVAL", "time between lookups of the topic (default 5s)", dur(&c.LookupInterval)},
@@ -112,9 +114,10 @@ type settings struct {
 }
 
 // resolve applies the defaults and checks every setting, returning a *ConfigError for the first bad one.
-// Without a conversation key the chat starts as a joiner: the key and the pin come from an invite (see
-// useConversation), so the pin settings are refused rather than ignored. A token is checked later, in
-// capability, because it needs the identity.
+// Without a conversation key a chat starts as a joiner: the key and the pin come from an invite (see
+// useConversation). The pin is then the one of the conversations started in the window, and a token, which is
+// for the key's conversation only, is refused. A token is checked later, in capability, because it needs the
+// identity.
 func (c Config) resolve() (settings, error) {
 	s := settings{Config: c}
 	if s.DataDir == "" {
@@ -145,8 +148,14 @@ func (c Config) resolve() (settings, error) {
 	if _, err := netip.ParseAddrPort(s.PinAddr); err != nil {
 		return s, &ConfigError{Setting: "pin", Err: fmt.Errorf("%w: %w", ErrMalformed, err)}
 	}
-	if c.ConversationKey == "" && (c.PinKey != "" || c.PinToken != "") {
+	if c.ConversationKey == "" && c.PinToken != "" {
 		return s, &ConfigError{Setting: "conversation-key", Err: ErrMissing}
+	}
+	if c.ConversationKey != "" || c.PinKey != "" {
+		s.pinKey = make(ed25519.PublicKey, ed25519.PublicKeySize)
+		if err := parseHex("pin-key", c.PinKey, s.pinKey); err != nil {
+			return s, err
+		}
 	}
 	if c.ConversationKey == "" {
 		return s, nil
@@ -155,16 +164,18 @@ func (c Config) resolve() (settings, error) {
 		return s, err
 	}
 	s.inConversation = true
-	s.pinKey = make(ed25519.PublicKey, ed25519.PublicKeySize)
-	if err := parseHex("pin-key", c.PinKey, s.pinKey); err != nil {
-		return s, err
-	}
 	if c.PinToken != "" {
 		if s.token, err = hex.DecodeString(c.PinToken); err != nil {
 			return s, &ConfigError{Setting: "pin-token", Err: fmt.Errorf("%w: %w", ErrMalformed, err)}
 		}
 	}
 	return s, nil
+}
+
+// fixedPort says whether the listen address names a port, which one socket only can hold.
+func (s settings) fixedPort() bool {
+	ap, err := netip.ParseAddrPort(s.Listen)
+	return err == nil && ap.Port() != 0
 }
 
 // useConversation takes the key and the pin from an invite, or from the file that kept them.

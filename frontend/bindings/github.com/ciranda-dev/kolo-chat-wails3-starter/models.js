@@ -7,6 +7,129 @@
 import { Create as $Create } from "@wailsio/runtime";
 
 /**
+ * AppInfo is what Start returns. CanCreate says the app has a pin, which a new conversation needs.
+ */
+export class AppInfo {
+    /**
+     * Creates a new AppInfo instance.
+     * @param {Partial<AppInfo>} [$$source = {}] - The source object to create the AppInfo.
+     */
+    constructor($$source = {}) {
+        if (!("conversations" in $$source)) {
+            /**
+             * @member
+             * @type {ConversationInfo[]}
+             */
+            this["conversations"] = [];
+        }
+        if (!("maxConversations" in $$source)) {
+            /**
+             * @member
+             * @type {number}
+             */
+            this["maxConversations"] = 0;
+        }
+        if (!("canCreate" in $$source)) {
+            /**
+             * @member
+             * @type {boolean}
+             */
+            this["canCreate"] = false;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new AppInfo instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {AppInfo}
+     */
+    static createFrom($$source = {}) {
+        const $$createField0_0 = $$createType1;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("conversations" in $$parsedSource) {
+            $$parsedSource["conversations"] = $$createField0_0($$parsedSource["conversations"]);
+        }
+        return new AppInfo(/** @type {Partial<AppInfo>} */($$parsedSource));
+    }
+}
+
+/**
+ * ConversationInfo is one conversation as the window lists it. Me is our kolo-id in it, Joined is false for the
+ * join that waits for an invite's answer, and Error says why it did not start, with the Folder it is in.
+ */
+export class ConversationInfo {
+    /**
+     * Creates a new ConversationInfo instance.
+     * @param {Partial<ConversationInfo>} [$$source = {}] - The source object to create the ConversationInfo.
+     */
+    constructor($$source = {}) {
+        if (!("id" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["id"] = "";
+        }
+        if (!("name" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["name"] = "";
+        }
+        if (!("me" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["me"] = "";
+        }
+        if (!("joined" in $$source)) {
+            /**
+             * @member
+             * @type {boolean}
+             */
+            this["joined"] = false;
+        }
+        if (!("owner" in $$source)) {
+            /**
+             * @member
+             * @type {boolean}
+             */
+            this["owner"] = false;
+        }
+        if (!("error" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["error"] = "";
+        }
+        if (!("folder" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["folder"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new ConversationInfo instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {ConversationInfo}
+     */
+    static createFrom($$source = {}) {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new ConversationInfo(/** @type {Partial<ConversationInfo>} */($$parsedSource));
+    }
+}
+
+/**
  * InviteInfo describes an invite for the window. Code is the invite's secret: only the answer of CreateInvite
  * has it, since kolo-invite does not give a code back later.
  */
@@ -180,3 +303,7 @@ export class Member {
         return new Member(/** @type {Partial<Member>} */($$parsedSource));
     }
 }
+
+// Private type creation functions
+const $$createType0 = ConversationInfo.createFrom;
+const $$createType1 = $Create.Array($$createType0);

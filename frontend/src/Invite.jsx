@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Join, CancelJoin, CreateInvite, Invites, Revoke, Approve, Deny } from "../bindings/github.com/ciranda-dev/kolo-chat-wails3-starter/chatservice.js"
+import { Join, CancelJoin, CreateInvite, Invites, Revoke, Approve, Deny } from "../bindings/github.com/ciranda-dev/kolo-chat-wails3-starter/conversations.js"
 import { Events } from "@wailsio/runtime"
 
 /** @typedef {{ id: string, code?: string, expires: string, uses: number, used: number, requireApproval: boolean, state: string }} InviteInfo */
@@ -22,15 +22,19 @@ const EXPIRIES = [
   { label: '7 days', seconds: 604800 },
 ]
 
-/** Shown instead of the chat until the user has joined a conversation: paste the code of an invite. */
-export function JoinPanel({ onJoined }) {
+/**
+ * Join with an invite: paste its code and give the conversation a name. It is also the screen of an app with no
+ * conversation. Each invite joins as a new conversation, with a key of its own on this device.
+ */
+export function JoinPanel({ empty = false, onJoined }) {
   const [code, setCode] = useState('')
+  const [name, setName] = useState('')
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState('')
   const [error, setError] = useState('')
 
   useEffect(() => {
-    return Events.On("chat:join", (e) => setStatus(e.data?.status === 'failed' ? '' : (e.data?.message ?? '')))
+    return Events.On("chat:join", (e) => setStatus(e.data?.data?.status === 'failed' ? '' : (e.data?.data?.message ?? '')))
   }, [])
 
   const join = (ev) => {
@@ -40,8 +44,8 @@ export function JoinPanel({ onJoined }) {
     }
     setBusy(true)
     setError('')
-    Join(code)
-      .then(() => onJoined())
+    Join(code, name)
+      .then((info) => onJoined(info))
       .catch((err) => setError(errorText(err)))
       .finally(() => {
         setBusy(false)
@@ -51,7 +55,8 @@ export function JoinPanel({ onJoined }) {
 
   return (
     <form className="panel panel--center" onSubmit={join}>
-      <h2 className="panel__title">Join a conversation</h2>
+      <h2 className="panel__title">Join with an invite</h2>
+      {empty ? <p className="note">No conversation yet. Start one, or paste an invite.</p> : null}
       <p className="note">Paste the invite code you received. If the owner wants to approve you, this waits for the answer.</p>
       <input
         className="field"
@@ -61,6 +66,16 @@ export function JoinPanel({ onJoined }) {
         placeholder="Invite code"
         autoComplete="off"
         spellCheck={false}
+        disabled={busy}
+      />
+      <input
+        className="field"
+        aria-label="Name"
+        value={name}
+        maxLength={32}
+        onChange={(ev) => setName(ev.target.value)}
+        placeholder="Name: Family, Work... (only you see it)"
+        autoComplete="off"
         disabled={busy}
       />
       <div className="panel__row">
@@ -73,8 +88,8 @@ export function JoinPanel({ onJoined }) {
   )
 }
 
-/** Create an invite (expiry, uses, approval) and see or revoke the ones made so far. */
-export function InvitePanel() {
+/** Create an invite (expiry, uses, approval) for the conversation conv, and see or revoke the ones made so far. */
+export function InvitePanel({ conv }) {
   const [seconds, setSeconds] = useState(86400)
   const [uses, setUses] = useState(1)
   const [approval, setApproval] = useState(true)
@@ -83,19 +98,19 @@ export function InvitePanel() {
   const [error, setError] = useState('')
 
   useEffect(() => {
-    Invites().then((list) => setInvites(list ?? [])).catch((err) => setError(errorText(err)))
+    Invites(conv).then((list) => setInvites(list ?? [])).catch((err) => setError(errorText(err)))
     return Events.On("chat:invite", (e) => {
-      const info = e.data
+      const info = e.data?.conv === conv ? e.data.data : null
       if (info?.id) {
         setInvites((prev) => prev.map((i) => (i.id === info.id ? info : i)))
       }
     })
-  }, [])
+  }, [conv])
 
   const create = (ev) => {
     ev.preventDefault()
     setError('')
-    CreateInvite({ ttlSeconds: seconds, uses: Number(uses) || 1, requireApproval: approval })
+    CreateInvite(conv, { ttlSeconds: seconds, uses: Number(uses) || 1, requireApproval: approval })
       .then((info) => {
         setCodes((prev) => ({ ...prev, [info.id]: info.code }))
         setInvites((prev) => [...prev, info])
@@ -105,7 +120,7 @@ export function InvitePanel() {
 
   const revoke = (id) => {
     setError('')
-    Revoke(id).catch((err) => setError(errorText(err)))
+    Revoke(conv, id).catch((err) => setError(errorText(err)))
   }
 
   return (
@@ -165,12 +180,14 @@ export function InvitePanel() {
   )
 }
 
-/** The people waiting to be let in, each with Approve and Deny. */
-export function Requests({ requests }) {
+/** The people waiting to be let in to the conversation conv, each with Approve and Deny. */
+export function Requests({ conv, requests, onDone }) {
   const [error, setError] = useState('')
   const answer = (call, request) => {
     setError('')
-    call(request).catch((err) => setError(errorText(err)))
+    call(conv, request)
+      .then(() => onDone?.(request))
+      .catch((err) => setError(errorText(err)))
   }
   if (requests.length === 0) {
     return error ? <p className="error">{error}</p> : null

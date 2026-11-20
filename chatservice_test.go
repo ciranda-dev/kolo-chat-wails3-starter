@@ -439,7 +439,8 @@ func TestConfig(t *testing.T) {
 		want   error
 		field  string
 	}{
-		{"no conversation key", func(c *Config) { c.ConversationKey = "" }, ErrMissing, "conversation-key"},
+		{"a token without a conversation key", func(c *Config) { c.ConversationKey, c.PinToken = "", "aa" }, ErrMissing, "conversation-key"},
+		{"a bad pin key without a conversation key", func(c *Config) { c.ConversationKey, c.PinKey = "", "abcd" }, ErrMalformed, "pin-key"},
 		{"short conversation key", func(c *Config) { c.ConversationKey = "abcd" }, ErrMalformed, "conversation-key"},
 		{"no pin key", func(c *Config) { c.PinKey = "" }, ErrMissing, "pin-key"},
 		{"bad pin address", func(c *Config) { c.PinAddr = "pin.example" }, ErrMalformed, "pin"},

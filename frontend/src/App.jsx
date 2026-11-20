@@ -1,13 +1,16 @@
-import { useState, useEffect, useRef } from 'react'
-import { Start, Send, Joined, Members, Rooms, IsOwner } from "../bindings/github.com/ciranda-dev/kolo-chat-wails3-starter/chatservice.js"
+import { useState, useEffect, useReducer, useRef } from 'react'
+import { Start, Send, Members, Rooms } from "../bindings/github.com/ciranda-dev/kolo-chat-wails3-starter/conversations.js"
 import { Events } from "@wailsio/runtime"
 import logo from './assets/kolo-mark.svg'
+import { ConversationList } from './Conversations.jsx'
 import { JoinPanel, InvitePanel, Requests } from './Invite.jsx'
+import { Modal } from './Modal.jsx'
 import { ProfilePanel, Sidebar, labelFor } from './Profile.jsx'
+import { convOf, initialState, reduce, shownRows } from './conversations.js'
 import './chat.css'
-import { appendMessage } from './messages.js'
 
-/** @typedef {{ id: number, from: string, room: string, text: string, mine: boolean, via: string }} Msg */
+/** The events of the conversations, each { conv, data }; "chat:join" and "chat:invite" go to their panels. */
+const CHAT_EVENTS = ['chat:msg', 'chat:peers', 'chat:pin', 'chat:profiles', 'chat:rooms', 'chat:invite-request']
 
 /** First 8 characters of a kolo-id, enough to tell peers apart. */
 const shortId = (id) => (id ? id.slice(0, 8) : '')
@@ -24,113 +27,83 @@ function errorText(err) {
 }
 
 function App() {
-  const [messages, setMessages] = useState(/** @type {Msg[]} */ ([]))
-  const [draft, setDraft] = useState('')
+  const [state, dispatch] = useReducer(reduce, initialState)
+  const [app, setApp] = useState({ maxConversations: 0, canCreate: false })
+  const [startError, setStartError] = useState('')
   const [error, setError] = useState('')
-  const [me, setMe] = useState('')
-  const [peers, setPeers] = useState(0)
-  const [pin, setPin] = useState({ error: '', locked: 0 })
-  const [failed, setFailed] = useState(false)
-  const [joined, setJoined] = useState(/** @type {boolean | null} */ (null)) // null until the app says
-  const [inviting, setInviting] = useState(false)
-  const [requests, setRequests] = useState([])
-  const [members, setMembers] = useState([])
-  const [rooms, setRooms] = useState(['general'])
   const [room, setRoom] = useState('general')
-  const [isOwner, setIsOwner] = useState(false)
+  const [joining, setJoining] = useState(false)
+  const [inviting, setInviting] = useState(false)
   const [editing, setEditing] = useState(false)
-  const status = failed ? 'error' : peers > 0 ? 'live' : 'waiting'
   const bottomRef = useRef(null)
-  const nextId = useRef(1)
 
-  /** The members, the rooms and whether we own the conversation, once we are in one. */
-  const loadDirectory = () => {
-    Promise.all([Members(), Rooms(), IsOwner()])
-      .then(([m, r, owner]) => {
-        setMembers(m ?? [])
-        setRooms(r ?? ['general'])
-        setIsOwner(owner)
-      })
+  const rows = shownRows(state.list)
+  const row = rows.find((r) => r.id === state.selected)
+  const conv = convOf(state, state.selected)
+  const joined = row?.joined === true && !row.error
+  const pending = state.list.find((r) => !r.joined && !r.error)
+
+  /** The members and the rooms of a conversation, which its engine told before the window listened. */
+  const loadDirectory = (id) => {
+    Promise.all([Members(id), Rooms(id)])
+      .then(([members, rooms]) => dispatch({ type: 'directory', conv: id, members, rooms }))
       .catch((err) => setError(errorText(err)))
   }
 
   useEffect(() => {
+    const offs = CHAT_EVENTS.map((name) => Events.On(name, (e) => dispatch({ type: 'event', name, payload: e.data })))
+    offs.push(Events.On('chat:conversations', (e) => dispatch({ type: 'list', list: e.data })))
     Start()
-      .then((id) => {
-        setMe(id)
-        return Joined()
-      })
-      .then((yes) => {
-        setJoined(yes)
-        if (yes) {
-          loadDirectory()
+      .then((info) => {
+        setApp({ maxConversations: info.maxConversations, canCreate: info.canCreate })
+        dispatch({ type: 'list', list: info.conversations })
+        for (const c of shownRows(info.conversations)) {
+          if (c.joined && !c.error) {
+            loadDirectory(c.id)
+          }
         }
       })
-      .catch((err) => {
-        setFailed(true)
-        setError(errorText(err))
-      })
-    const offPeers = Events.On("chat:peers", (e) => setPeers(Number(e.data) || 0))
-    const offRequest = Events.On("chat:invite-request", (e) => {
-      const r = e.data
-      if (!r) {
-        return
-      }
-      setRequests((prev) => {
-        const rest = prev.filter((x) => x.request !== r.request)
-        return r.withdrawn ? rest : [...rest, r]
-      })
-    })
-    const offPin = Events.On("chat:pin", (e) => setPin({ error: e.data?.error ?? '', locked: e.data?.locked ?? 0 }))
-    const offProfiles = Events.On("chat:profiles", (e) => setMembers(e.data ?? []))
-    const offRooms = Events.On("chat:rooms", (e) => setRooms(e.data ?? ['general']))
-    const off = Events.On("chat:msg", e => {
-      const data = e.data
-      const from = typeof data === 'object' && data ? (data.from ?? '') : ''
-      const text = typeof data === 'object' && data ? (data.text ?? '') : String(data ?? '')
-      const via = typeof data === 'object' && data ? (data.via ?? '') : ''
-      const where = typeof data === 'object' && data ? (data.room ?? 'general') : 'general'
-      setMessages((prev) => appendMessage(prev, { id: nextId.current++, from, room: where, text, mine: false, via }))
-    })
-    return () => {
-      off()
-      offProfiles()
-      offRooms()
-      offPeers()
-      offRequest()
-      offPin()
-    }
+      .catch((err) => setStartError(errorText(err)))
+    return () => offs.forEach((off) => off())
   }, [])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: 'end' })
-  }, [messages])
+  }, [conv.messages])
 
-  const send = () => {
-    const text = draft.trim()
-    if (!text) {
-      return
-    }
-    Send(room, text)
-      .then(() => {
-        setError('')
-        setMessages((prev) => appendMessage(prev, { id: nextId.current++, from: me, room, text, mine: true, via: '' }))
-        setDraft('')
-      })
-      .catch((err) => {
-        setError(errorText(err))
-      })
+  const select = (id) => {
+    dispatch({ type: 'select', id })
+    setRoom('general')
+    setJoining(false)
+    setError('')
   }
 
-  const mine = members.find((m) => m.key === me)
-  const shown = messages.filter((m) => m.room === room)
+  /** A conversation made or joined here: select it and read its members and rooms. */
+  const added = (info) => {
+    select(info.id)
+    loadDirectory(info.id)
+  }
 
-  const badge =
-    status === 'live'
-      ? `${peers} ${peers === 1 ? 'peer' : 'peers'}`
-      : status === 'error'
-        ? 'Error'
-        : 'Waiting for peer'
+  const send = () => {
+    const text = conv.draft.trim()
+    if (!text || !row) {
+      return
+    }
+    const id = row.id
+    Send(id, room, text)
+      .then(() => {
+        setError('')
+        dispatch({ type: 'sent', conv: id, from: row.me, room, text })
+      })
+      .catch((err) => setError(errorText(err)))
+  }
+
+  const mine = conv.members.find((m) => m.key === row?.me)
+  const shown = conv.messages.filter((m) => m.room === room)
+  const status = startError || row?.error ? 'error' : conv.peers > 0 ? 'live' : 'waiting'
+  const badge = status === 'live' ? `${conv.peers} ${conv.peers === 1 ? 'peer' : 'peers'}` : status === 'error' ? 'Error' : 'Waiting for peer'
+  // The main column: the join panel, also when there is no conversation, the reason one did not start, or the chat.
+  const view = startError ? 'start-error' : joining || rows.length === 0 ? 'join' : row?.error ? 'failed' : 'chat'
 
   return (
     <div className="app">
@@ -138,9 +111,9 @@ function App() {
         <img className="header__logo" src={logo} alt="" width={32} height={32} />
         <span className="header__name">kolo</span>
         <span className="header__spacer" />
-        {me ? (
-          <span className="header__id" title={me}>
-            you · {mine?.name || shortId(me)}
+        {joined ? (
+          <span className="header__id" title={row.me}>
+            {row.name} · you · {mine?.name || shortId(row.me)}
           </span>
         ) : null}
         {joined ? (
@@ -150,21 +123,57 @@ function App() {
         ) : null}
         {joined ? (
           <button type="button" className="header__btn" onClick={() => setInviting((open) => !open)}>
-            Invite{requests.length > 0 ? ` (${requests.length})` : ''}
+            Invite{conv.requests.length > 0 ? ` (${conv.requests.length})` : ''}
           </button>
         ) : null}
         <span className={`header__badge is-${status}`}>{badge}</span>
       </header>
 
-      {joined && inviting ? <InvitePanel /> : null}
-      {joined && editing ? <ProfilePanel mine={mine} onDone={() => setEditing(false)} /> : null}
+      {joined && inviting ? (
+        <Modal title={`Invite someone to ${row.name}`} onClose={() => setInviting(false)}>
+          <InvitePanel conv={row.id} />
+        </Modal>
+      ) : null}
+      {joined && editing ? (
+        <Modal title={`Your profile in ${row.name}`} onClose={() => setEditing(false)}>
+          <ProfilePanel conv={row.id} mine={mine} onDone={() => setEditing(false)} />
+        </Modal>
+      ) : null}
 
       <div className="body">
-        {joined ? <Sidebar rooms={rooms} room={room} onRoom={setRoom} members={members} isOwner={isOwner} /> : null}
+        {startError ? null : (
+          <ConversationList
+            rows={rows}
+            selected={view === 'join' ? '' : state.selected}
+            convs={state.convs}
+            canCreate={app.canCreate}
+            max={app.maxConversations}
+            count={state.list.length}
+            pending={Boolean(pending)}
+            onSelect={select}
+            onCreated={added}
+            onJoin={() => setJoining(true)}
+          />
+        )}
+        {joined && view === 'chat' ? (
+          <Sidebar conv={row.id} rooms={conv.rooms} room={room} onRoom={setRoom} members={conv.members} isOwner={row.owner} />
+        ) : null}
         <div className="main">
-          {joined === false ? (
-            <JoinPanel onJoined={() => { setJoined(true); loadDirectory() }} />
-          ) : (
+          {view === 'join' ? <JoinPanel empty={rows.length === 0} onJoined={added} /> : null}
+          {view === 'start-error' ? (
+            <div className="panel panel--center">
+              <h2 className="panel__title">Kolo Chat could not start</h2>
+              <p className="error">{startError}</p>
+            </div>
+          ) : null}
+          {view === 'failed' ? (
+            <div className="panel panel--center">
+              <h2 className="panel__title">This conversation could not start.</h2>
+              <p className="error">{row.error}</p>
+              {row.folder ? <p className="note">Its folder: <code>{row.folder}</code></p> : null}
+            </div>
+          ) : null}
+          {view === 'chat' ? (
             <div className="messages" role="log" aria-live="polite">
               {shown.length === 0 ? (
                 <p className="empty">No messages in # {room} yet. Open a second window and say hi.</p>
@@ -173,7 +182,7 @@ function App() {
                   <div key={msg.id} className={`row ${msg.mine ? 'is-mine' : 'is-theirs'}`}>
                     <div className="msg">
                       <span className="msg__from" title={msg.from}>
-                        {msg.mine ? 'you' : labelFor(members, msg.from) || 'peer'}
+                        {msg.mine ? 'you' : labelFor(conv.members, msg.from) || 'peer'}
                         {msg.via === 'pin' ? <span className="msg__via"> · synced from pin</span> : null}
                       </span>
                       <div className="bubble">{msg.text}</div>
@@ -183,18 +192,20 @@ function App() {
               )}
               <div ref={bottomRef} />
             </div>
-          )}
-
-          <Requests requests={requests} />
-          {error ? <p className="error">{error}</p> : null}
-          {pin.error ? <p className="error">{pin.error}</p> : null}
-          {!pin.error && pin.locked > 0 ? (
-            <p className="note">
-              {pin.locked} pinned {pin.locked === 1 ? 'message waits' : 'messages wait'} for the sender to come online.
-            </p>
           ) : null}
 
           {joined ? (
+            <Requests conv={row.id} requests={conv.requests} onDone={(request) => dispatch({ type: 'request-done', conv: row.id, request })} />
+          ) : null}
+          {error ? <p className="error">{error}</p> : null}
+          {joined && conv.pin.error ? <p className="error">{conv.pin.error}</p> : null}
+          {joined && !conv.pin.error && conv.pin.locked > 0 ? (
+            <p className="note">
+              {conv.pin.locked} pinned {conv.pin.locked === 1 ? 'message waits' : 'messages wait'} for the sender to come online.
+            </p>
+          ) : null}
+
+          {view === 'chat' && joined ? (
             <form
               className="composer"
               onSubmit={(ev) => {
@@ -205,8 +216,8 @@ function App() {
               <input
                 className="composer__input"
                 aria-label="Message"
-                value={draft}
-                onChange={(ev) => setDraft(ev.target.value)}
+                value={conv.draft}
+                onChange={(ev) => dispatch({ type: 'draft', conv: row.id, text: ev.target.value })}
                 type="text"
                 placeholder={`Message # ${room}`}
                 autoComplete="off"
